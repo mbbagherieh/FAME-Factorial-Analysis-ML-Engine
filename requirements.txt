@@ -2,7 +2,7 @@ streamlit
 numpy
 pandas
 scipy
-matplotlib
-seaborn
 scikit-learn
 statsmodels
+shap
+matplotlib
