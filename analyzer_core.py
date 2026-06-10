@@ -347,7 +347,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
     st. set_page_config(page_title=f"FAME — {app_title}", page_icon="🌿", layout="wide")
     st.title(f"🌿 {app_title}")
     st.markdown("Upload your experimental data for comprehensive statistical and machine learning analysis.")
-    
+
     # ============================================================
     # SIDEBAR
     # ============================================================
@@ -356,7 +356,8 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
     uploaded_file = st.sidebar.file_uploader(
         "Upload CSV file",
         type=['csv'],
-        help="Upload your experimental data as a comma-separated values (.csv) file."
+        help="Upload your experimental data as a comma-separated values (.csv) file. "
+             "The first row should contain column headers matching your factor and response names."
     )
     
     st.sidebar.subheader(f"Factor Columns ({n_factors_default} factors)")
@@ -366,7 +367,9 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
         factor_name = st.sidebar.text_input(
             f"Factor {i+1} name",
             value=default_factor_names[i] if i < len(default_factor_names) else f"Factor{i+1}",
-            key=f"factor_{i}"
+            key=f"factor_{i}",
+            help=f"Enter the exact column name for Factor {i+1} as it appears in your CSV file. "
+                 f"This is an independent variable (treatment/predictor) in your experiment."
         )
         if factor_name.strip():
             FACTOR_COLS.append(factor_name.strip())
@@ -374,22 +377,56 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
     st.sidebar.subheader("Response Columns")
     response_input = st.sidebar.text_area(
         "Response column names (one per line)",
-        value=default_responses
+        value=default_responses,
+        help="Enter the column names of your response (dependent) variables, one per line. "
+             "These are the outcomes or measurements you wish to analyze. "
+             "Each line corresponds to one response column in your CSV file."
     )
     
     st.sidebar.subheader("Post-Hoc Test")
     posthoc_method = st.sidebar.selectbox(
         "Mean comparison method",
         options=["Tukey's HSD", "Fisher's LSD"],
-        index=0
+        index=0,
+        help="Post-hoc test for comparing treatment means after ANOVA. "
+             "Tukey's HSD is more conservative (controls family-wise error rate, recommended for ≥3 groups). "
+             "Fisher's LSD is more liberal (higher power but greater risk of false positives)."
     )
     
     st.sidebar.subheader("Advanced Settings")
-    n_categories = st.sidebar.slider("ANOVA categories per factor", min_value=2, max_value=5, value=3)
-    cv_folds = st.sidebar.slider("Cross-validation folds", min_value=3, max_value=10, value=5)
-    n_bootstrap = st.sidebar.number_input("Bootstrap iterations", min_value=100, max_value=5000, value=1000, step=100)
-    rf_estimators = st.sidebar.slider("Random Forest estimators", min_value=50, max_value=500, value=200, step=50)
-    random_state = st.sidebar.number_input("Random seed", min_value=0, max_value=999, value=42)
+    n_categories = st.sidebar.slider(
+        "ANOVA categories per factor",
+        min_value=2, max_value=5, value=3,
+        help="Number of bins/categories to split each continuous factor into for ANOVA. "
+             "For example, 3 creates 'Low', 'Medium', 'High' groups. "
+             "Higher values give finer resolution but may create sparse groups."
+    )
+    cv_folds = st.sidebar.slider(
+        "Cross-validation folds",
+        min_value=3, max_value=10, value=5,
+        help="Number of folds for K-Fold cross-validation. "
+             "Higher values (e.g., 10) give more reliable estimates but take longer. "
+             "Lower values (e.g., 3) are faster but have higher variance."
+    )
+    n_bootstrap = st.sidebar.number_input(
+        "Bootstrap iterations",
+        min_value=100, max_value=5000, value=1000, step=100,
+        help="Number of bootstrap resamples for computing confidence intervals of standardized β coefficients. "
+             "More iterations (e.g., 2000-5000) give more stable confidence intervals but take longer."
+    )
+    rf_estimators = st.sidebar.slider(
+        "Random Forest estimators",
+        min_value=50, max_value=500, value=200, step=50,
+        help="Number of decision trees in the Random Forest model. "
+             "More trees (e.g., 300-500) give smoother, more stable results but increase computation time."
+    )
+    random_state = st.sidebar.number_input(
+        "Random seed",
+        min_value=0, max_value=999, value=42,
+        help="Seed for the random number generator. "
+             "Using the same seed ensures reproducible results across runs. "
+             "Change this value to test stability of your findings."
+    )
     
     # ============================================================
     # FIGURE LAYOUT SETTINGS
@@ -399,15 +436,70 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
     st.sidebar.caption("Single-column (~85 mm) or two-column (~170 mm) A4 journal layout.")
     
     fig_layout = {}
-    fig_layout['fig1'] = st.sidebar.selectbox("Fig 1: SHAP Importance", options=["Two-Column", "Single-Column"], index=0, key="layout_fig1")
-    fig_layout['fig2'] = st.sidebar.selectbox("Fig 2: SHAP Beeswarm", options=["Two-Column", "Single-Column"], index=0, key="layout_fig2")
-    fig_layout['fig3'] = st.sidebar.selectbox("Fig 3: GPR Contours", options=["Two-Column", "Single-Column"], index=0, key="layout_fig3")
-    fig_layout['fig4'] = st.sidebar.selectbox("Fig 4: MORF Residuals", options=["Single-Column", "Two-Column"], index=0, key="layout_fig4")
-    fig_layout['fig5'] = st.sidebar.selectbox("Fig 5: Standardized Beta", options=["Two-Column", "Single-Column"], index=0, key="layout_fig5")
-    fig_layout['fig6'] = st.sidebar.selectbox("Fig 6: Model Comparison", options=["Two-Column", "Single-Column"], index=0, key="layout_fig6")
-    fig_layout['fig7'] = st.sidebar.selectbox("Fig 7: PCA Biplot", options=["Single-Column", "Two-Column"], index=0, key="layout_fig7")
-    fig_layout['figS1'] = st.sidebar.selectbox("Fig S1: Permutation Importance", options=["Two-Column", "Single-Column"], index=0, key="layout_figS1")
-    
+    fig_layout['fig1'] = st.sidebar.selectbox(
+        "Fig 1: SHAP Importance",
+        options=["Two-Column", "Single-Column"],
+        index=0, key="layout_fig1",
+        help="Bar chart showing the relative importance (%) of each factor for every response, "
+             "as determined by SHAP (SHapley Additive exPlanations) values from the Random Forest model."
+    )
+    fig_layout['fig2'] = st.sidebar.selectbox(
+        "Fig 2: SHAP Beeswarm",
+        options=["Two-Column", "Single-Column"],
+        index=0, key="layout_fig2",
+        help="Beeswarm plot visualizing individual SHAP values for each factor-response pair. "
+             "Each dot is an observation; blue = high factor value, red = low factor value. "
+             "The spread shows the direction and magnitude of each factor's effect."
+    )
+    fig_layout['fig3'] = st.sidebar.selectbox(
+        "Fig 3: GPR Contours",
+        options=["Two-Column", "Single-Column"],
+        index=0, key="layout_fig3",
+        help="Gaussian Process Regression contour plots for significant two-way interactions. "
+             "Shows the predicted response surface as a function of two interacting factors. "
+             "Red dots mark actual observations."
+    )
+    fig_layout['fig4'] = st.sidebar.selectbox(
+        "Fig 4: MORF Residuals",
+        options=["Single-Column", "Two-Column"],
+        index=0, key="layout_fig4",
+        help="Multi-Output Random Forest (MORF) residual correlation matrix. "
+             "Shows correlations between response residuals after accounting for factor effects. "
+             "Strong off-diagonal values suggest shared variance not explained by the factors."
+    )
+    fig_layout['fig5'] = st.sidebar.selectbox(
+        "Fig 5: Standardized Beta",
+        options=["Two-Column", "Single-Column"],
+        index=0, key="layout_fig5",
+        help="Standardized regression coefficients (β) with 95% bootstrap confidence intervals. "
+             "Bars crossing zero indicate non-significant effects. "
+             "Error bars show bootstrap CI uncertainty."
+    )
+    fig_layout['fig6'] = st.sidebar.selectbox(
+        "Fig 6: Model Comparison",
+        options=["Two-Column", "Single-Column"],
+        index=0, key="layout_fig6",
+        help="Cross-validated R² comparison of three models: Random Forest (RF), "
+             "Linear Regression (LR), and Gaussian Process Regression (GPR). "
+             "Error bars show ±1 standard deviation across CV folds."
+    )
+    fig_layout['fig7'] = st.sidebar.selectbox(
+        "Fig 7: PCA Biplot",
+        options=["Single-Column", "Two-Column"],
+        index=0, key="layout_fig7",
+        help="Principal Component Analysis biplot showing treatment groups in PC space. "
+             "Red arrows indicate response variable loadings. "
+             "Closer groups have more similar response profiles."
+    )
+    fig_layout['figS1'] = st.sidebar.selectbox(
+        "Fig S1: Permutation Importance",
+        options=["Two-Column", "Single-Column"],
+        index=0, key="layout_figS1",
+        help="Permutation-based feature importance as a validation of SHAP results. "
+             "Measures the drop in model R² when each factor's values are randomly shuffled. "
+             "Higher values indicate greater importance."
+    )    
+       
     # ============================================================
     # MAIN
     # ============================================================
