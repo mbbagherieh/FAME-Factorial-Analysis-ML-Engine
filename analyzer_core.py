@@ -992,23 +992,47 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                         # ============================================================
                         progress_bar.progress(75, text="Generating publication-ready figures...")
                         
-                        SINGLE_COL = 3.35
-                        DOUBLE_COL = 6.7
-                        DPI = 600
-                        FONT_BASE = 9
-                        FONT_LABEL = 10
-                        FONT_TICK = 8
-                        FONT_TITLE = 10
-                        FONT_MATRIX = 5.5
-                        TITLE_GAP = 1.07
+                        # Physical widths for journal column formats (in inches)
+                        SINGLE_COL = 3.35   # ~85 mm — single-column journal width
+                        DOUBLE_COL = 6.7    # ~170 mm — two-column (full page) width
+                        DPI = 600           # High resolution for publication
+                        TITLE_GAP = 1.07    # Vertical position of suptitle
+                        
+                        # Reference font sizes (calibrated on two-column 6.7" figures)
+                        FONT_BASE_REF = 9
+                        FONT_LABEL_REF = 10
+                        FONT_TICK_REF = 8
+                        FONT_TITLE_REF = 10
+                        FONT_MATRIX_REF = 5.5
                         
                         def get_width(fig_key):
-                            return DOUBLE_COL if fig_layout.get(fig_key,'Two-Column')=='Two-Column' else SINGLE_COL
+                            """Return figure width in inches based on user's layout choice."""
+                            return DOUBLE_COL if fig_layout.get(fig_key, 'Two-Column') == 'Two-Column' else SINGLE_COL
+                        
+                        def get_fonts(fig_key):
+                            """Return font sizes scaled to the selected figure width.
+                            
+                            Single-column figures (~3.35") get fonts scaled to ~55%
+                            of the two-column size. Minimum floors prevent illegibility.
+                            """
+                            w = get_width(fig_key)
+                            scale = w / DOUBLE_COL  # 1.0 for two-column, ~0.5 for single-column
+                            # Apply a slightly more aggressive scaling curve
+                            adjusted_scale = scale ** 1.15
+                            return {
+                                'base': max(5, FONT_BASE_REF * adjusted_scale),
+                                'label': max(5.5, FONT_LABEL_REF * adjusted_scale),
+                                'tick': max(5, FONT_TICK_REF * adjusted_scale),
+                                'title': max(5.5, FONT_TITLE_REF * adjusted_scale),
+                                'matrix': max(3.5, FONT_MATRIX_REF * adjusted_scale),
+                            }
                         
                         plt.rcParams.update({
-                            'font.size': FONT_BASE, 'axes.titlesize': FONT_TITLE, 'axes.labelsize': FONT_LABEL,
-                            'xtick.labelsize': FONT_TICK, 'ytick.labelsize': FONT_TICK, 'legend.fontsize': FONT_TICK,
-                            'figure.dpi': DPI, 'savefig.dpi': DPI, 'savefig.bbox': 'tight', 'font.family': 'sans-serif'
+                            'font.size': FONT_BASE_REF, 'axes.titlesize': FONT_TITLE_REF,
+                            'axes.labelsize': FONT_LABEL_REF, 'xtick.labelsize': FONT_TICK_REF,
+                            'ytick.labelsize': FONT_TICK_REF, 'legend.fontsize': FONT_TICK_REF,
+                            'figure.dpi': DPI, 'savefig.dpi': DPI, 'savefig.bbox': 'tight',
+                            'font.family': 'sans-serif'
                         })
                         
                         figure_buffers_png = {}
@@ -1016,6 +1040,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                         colors_list = plt.cm.Set2(np.linspace(0, 1, max(n_factors, 2)))
                         
                         # --- Fig 1: SHAP Importance ---
+                        f1 = get_fonts('fig1')
                         fig1_w = get_width('fig1')
                         fig1, ax1 = plt.subplots(figsize=(fig1_w, fig1_w*0.55))
                         shap_norm = shap_imp/(shap_imp.sum(axis=1,keepdims=True)+1e-10)*100
@@ -1026,10 +1051,10 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                     color=colors_list[i%len(colors_list)], edgecolor='black', linewidth=0.3)
                         ax1.set_xticks(x_pos+width*(n_factors-1)/2)
                         ax1.set_xticklabels(RESPONSE_COLS, rotation=30, ha='right')
-                        ax1.set_ylabel('Relative Importance (%)', fontsize=FONT_LABEL, fontweight='bold')
-                        ax1.legend(fontsize=FONT_TICK, framealpha=0.8)
+                        ax1.set_ylabel('Relative Importance (%)', fontsize=f1['label'], fontweight='bold')
+                        ax1.legend(fontsize=f1['tick'], framealpha=0.8)
                         ax1.grid(True, axis='y', alpha=0.3)
-                        fig1.suptitle('SHAP Feature Importance Rankings', fontsize=FONT_TITLE, fontweight='bold', y=TITLE_GAP)
+                        fig1.suptitle('SHAP Feature Importance Rankings', fontsize=f1['title'], fontweight='bold', y=TITLE_GAP)
                         fig1.tight_layout(rect=[0,0,1,0.95])
                         buf1 = io.BytesIO(); fig1.savefig(buf1, format='png', dpi=DPI, bbox_inches='tight'); buf1.seek(0)
                         figure_buffers_png['Fig_1_SHAP_Importance.png'] = buf1
@@ -1037,6 +1062,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                         figure_buffers_pdf['Fig_1_SHAP_Importance.pdf'] = buf1p
                         
                         # --- Fig 2: SHAP Beeswarm ---
+                        f2 = get_fonts('fig2')
                         fig2_w = get_width('fig2')
                         n_cols_b = min(3, n_responses)
                         n_rows_b = (n_responses+n_cols_b-1)//n_cols_b
@@ -1064,13 +1090,13 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                             except:
                                 ax.text(0.5, 0.5, 'N/A', transform=ax.transAxes, ha='center', va='center')
                             ax.set_yticks(range(n_factors))
-                            if idx//n_cols_b == n_rows_b-1: ax.set_xlabel('SHAP Value', fontsize=FONT_LABEL, fontweight='bold')
-                            if idx%n_cols_b==0: ax.set_yticklabels(FACTOR_COLS, fontsize=FONT_TICK)
+                            if idx//n_cols_b == n_rows_b-1: ax.set_xlabel('SHAP Value', fontsize=f2['label'], fontweight='bold')
+                            if idx%n_cols_b==0: ax.set_yticklabels(FACTOR_COLS, fontsize=f2['tick'])
                             else: ax.set_yticklabels([])
-                            ax.set_title(resp, fontsize=FONT_TITLE, fontweight='bold')
+                            ax.set_title(resp, fontsize=f2['title'], fontweight='bold')
                             for i in range(n_factors-1): ax.axhline(y=i+0.5, color='gray', linestyle='--', linewidth=0.3, alpha=0.5)
                         for idx in range(n_responses, len(axes2)): axes2[idx].set_visible(False)
-                        fig2.suptitle('SHAP Beeswarm Plots\n(Blue=High, Red=Low)', fontsize=FONT_TITLE, fontweight='bold', y=TITLE_GAP)
+                        fig2.suptitle('SHAP Beeswarm Plots\n(Blue=High, Red=Low)', fontsize=f2['title'], fontweight='bold', y=TITLE_GAP)
                         fig2.tight_layout(rect=[0,0,1,0.93])
                         buf2 = io.BytesIO(); fig2.savefig(buf2, format='png', dpi=DPI, bbox_inches='tight'); buf2.seek(0)
                         figure_buffers_png['Fig_2_SHAP_Beeswarm.png'] = buf2
@@ -1079,6 +1105,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                         
                         # --- Fig 3: GPR Contours ---
                         if n_factors>=2 and len(sig_int)>0:
+                            f3 = get_fonts('fig3')
                             fig3_w = get_width('fig3')
                             n_sig = len(sig_int)
                             n_cols_g = min(3, n_sig)
@@ -1113,14 +1140,14 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                     ax.contour(G1o, G2o, Zp, levels=6, colors='black', linewidths=0.3, alpha=0.5)
                                     ax.scatter(Xp[:,0], Xp[:,1], c='red', s=6, edgecolors='white', linewidth=0.2, alpha=0.8, zorder=5)
                                     cbar = plt.colorbar(cf, ax=ax, shrink=0.8)
-                                    cbar.set_label(resp, fontsize=FONT_TICK); cbar.ax.tick_params(labelsize=FONT_TICK-1)
-                                    ax.set_title(f'{resp}  |  Fit R² = {r2_train:.3f}', fontsize=FONT_TITLE-1, fontweight='bold')
+                                    cbar.set_label(resp, fontsize=f3['tick']); cbar.ax.tick_params(labelsize=f3['tick']-1)
+                                    ax.set_title(f'{resp}  |  Fit R² = {r2_train:.3f}', fontsize=f3['title']-1, fontweight='bold')
                                 except:
                                     ax.text(0.5, 0.5, 'GPR failed', transform=ax.transAxes, ha='center')
-                                ax.set_xlabel(f1, fontsize=FONT_BASE, fontweight='normal')
-                                ax.set_ylabel(f2, fontsize=FONT_BASE, fontweight='normal')
+                                ax.set_xlabel(f1, fontsize=f3['base'], fontweight='normal')
+                                ax.set_ylabel(f2, fontsize=f3['base'], fontweight='normal')
                             for idx in range(n_sig, len(axes3)): axes3[idx].set_visible(False)
-                            fig3.suptitle('GPR Contour Surfaces', fontsize=FONT_TITLE, fontweight='bold', y=TITLE_GAP)
+                            fig3.suptitle('GPR Contour Surfaces', fontsize=f3['title'], fontweight='bold', y=TITLE_GAP)
                             fig3.tight_layout(rect=[0,0,1,0.93])
                             buf3 = io.BytesIO(); fig3.savefig(buf3, format='png', dpi=DPI, bbox_inches='tight'); buf3.seek(0)
                             figure_buffers_png['Fig_3_GPR_Contours.png'] = buf3
@@ -1129,6 +1156,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                         
                         # --- Fig 4: MORF Residuals ---
                         if n_responses >= 2:
+                            f4 = get_fonts('fig4')
                             fig4_w = get_width('fig4')
                             matrix_size = fig4_w*(1.0 if fig4_w==SINGLE_COL else 0.65)
                             fig4, ax4 = plt.subplots(figsize=(matrix_size, matrix_size*1.05))
@@ -1138,16 +1166,16 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                     if i!=j:
                                         tc = 'white' if abs(resid_corr[i,j])>0.5 else 'black'
                                         ax4.text(j, i, f'{resid_corr[i,j]:.2f}', ha='center', va='center',
-                                                fontsize=FONT_MATRIX, color=tc, fontweight='bold')
+                                                fontsize=f4['matrix'], color=tc, fontweight='bold')
                                     else:
-                                        ax4.text(j, i, '1.00', ha='center', va='center', fontsize=FONT_MATRIX, color='gray')
+                                        ax4.text(j, i, '1.00', ha='center', va='center', fontsize=f4['matrix'], color='gray')
                             ax4.set_xticks(range(n_responses)); ax4.set_yticks(range(n_responses))
                             short_names = [r[:10]+'…' if len(r)>10 else r for r in RESPONSE_COLS]
                             ax4.set_xticklabels(short_names, rotation=45, ha='right', fontsize=6)
                             ax4.set_yticklabels(short_names, fontsize=6)
                             cbar = plt.colorbar(im4, ax=ax4, shrink=0.85)
-                            cbar.set_label('Pearson r', fontsize=6); cbar.ax.tick_params(labelsize=FONT_MATRIX)
-                            fig4.suptitle('MORF Residual Correlation Matrix', fontsize=FONT_TITLE, fontweight='bold', y=TITLE_GAP)
+                            cbar.set_label('Pearson r', fontsize=6); cbar.ax.tick_params(labelsize=f4['matrix'])
+                            fig4.suptitle('MORF Residual Correlation Matrix', fontsize=f4['title'], fontweight='bold', y=TITLE_GAP)
                             fig4.tight_layout(rect=[0,0,1,0.94])
                             buf4 = io.BytesIO(); fig4.savefig(buf4, format='png', dpi=DPI, bbox_inches='tight'); buf4.seek(0)
                             figure_buffers_png['Fig_4_MORF_Correlations.png'] = buf4
@@ -1155,6 +1183,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                             figure_buffers_pdf['Fig_4_MORF_Correlations.pdf'] = buf4p
                         
                         # --- Fig 5: Standardized Beta ---
+                        f5 = get_fonts('fig5')
                         fig5_w = get_width('fig5')
                         fig5, ax5 = plt.subplots(figsize=(fig5_w, fig5_w*0.45))
                         x_pos_b = np.arange(n_responses); width_b = 0.8/n_factors if n_factors>0 else 0.4
@@ -1166,10 +1195,10 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                         ax5.axhline(y=0, color='black', linewidth=0.5)
                         ax5.set_xticks(x_pos_b+width_b*(n_factors-1)/2)
                         ax5.set_xticklabels(RESPONSE_COLS, rotation=30, ha='right')
-                        ax5.set_ylabel('Standardized β Coefficient', fontsize=FONT_LABEL, fontweight='bold')
-                        ax5.legend(fontsize=FONT_TICK, framealpha=0.8)
+                        ax5.set_ylabel('Standardized β Coefficient', fontsize=f5['label'], fontweight='bold')
+                        ax5.legend(fontsize=f5['tick'], framealpha=0.8)
                         ax5.grid(True, axis='y', alpha=0.3)
-                        fig5.suptitle('Standardized Regression Coefficients\nwith 95% Bootstrap CI', fontsize=FONT_TITLE, fontweight='bold', y=TITLE_GAP)
+                        fig5.suptitle('Standardized Regression Coefficients\nwith 95% Bootstrap CI', fontsize=f5['title'], fontweight='bold', y=TITLE_GAP)
                         fig5.tight_layout(rect=[0,0,1,0.95])
                         buf5 = io.BytesIO(); fig5.savefig(buf5, format='png', dpi=DPI, bbox_inches='tight'); buf5.seek(0)
                         figure_buffers_png['Fig_5_Standardized_Beta.png'] = buf5
@@ -1177,6 +1206,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                         figure_buffers_pdf['Fig_5_Standardized_Beta.pdf'] = buf5p
                         
                         # --- Fig 6: Model Comparison ---
+                        f6 = get_fonts('fig6')
                         fig6_w = get_width('fig6')
                         fig6, ax6 = plt.subplots(figsize=(fig6_w, fig6_w*0.40))
                         x_m = np.arange(n_responses); w_m = 0.25
@@ -1187,10 +1217,10 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                             ax6.bar(x_m+i_mn*w_m, m_vals, w_m, yerr=s_vals, label=mn,
                                     color=model_colors[mn], edgecolor='black', linewidth=0.3, capsize=2)
                         ax6.set_xticks(x_m+w_m); ax6.set_xticklabels(RESPONSE_COLS, rotation=30, ha='right')
-                        ax6.set_ylabel('Cross-Validated R²', fontsize=FONT_LABEL, fontweight='bold')
-                        ax6.legend(fontsize=FONT_TICK, framealpha=0.8)
+                        ax6.set_ylabel('Cross-Validated R²', fontsize=f6['label'], fontweight='bold')
+                        ax6.legend(fontsize=f6['tick'], framealpha=0.8)
                         ax6.grid(True, axis='y', alpha=0.3); ax6.set_ylim(0, 1.1)
-                        fig6.suptitle(f'Model Performance Comparison ({cv_folds}-Fold CV R²)', fontsize=FONT_TITLE, fontweight='bold', y=TITLE_GAP)
+                        fig6.suptitle(f'Model Performance Comparison ({cv_folds}-Fold CV R²)', fontsize=f6['title'], fontweight='bold', y=TITLE_GAP)
                         fig6.tight_layout(rect=[0,0,1,0.95])
                         buf6 = io.BytesIO(); fig6.savefig(buf6, format='png', dpi=DPI, bbox_inches='tight'); buf6.seek(0)
                         figure_buffers_png['Fig_6_Model_Comparison.png'] = buf6
@@ -1199,6 +1229,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                         
                         # --- Fig S1: Permutation ---
                         if n_factors>=2:
+                            fS1 = get_fonts('figS1')
                             figS1_w = get_width('figS1')
                             figS1, axS1 = plt.subplots(figsize=(figS1_w, figS1_w*0.55))
                             perm_norm = perm_imp/(perm_imp.sum(axis=1,keepdims=True)+1e-10)*100
@@ -1209,10 +1240,10 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                         yerr=perm_imp_std[:,i]/(perm_imp.sum(axis=1)+1e-10)*100, capsize=2)
                             axS1.set_xticks(x_pp+w_pp*(n_factors-1)/2)
                             axS1.set_xticklabels(RESPONSE_COLS, rotation=30, ha='right')
-                            axS1.set_ylabel('Relative Importance (%)', fontsize=FONT_LABEL, fontweight='bold')
-                            axS1.legend(fontsize=FONT_TICK, framealpha=0.8)
+                            axS1.set_ylabel('Relative Importance (%)', fontsize=fS1['label'], fontweight='bold')
+                            axS1.legend(fontsize=fS1['tick'], framealpha=0.8)
                             axS1.grid(True, axis='y', alpha=0.3)
-                            figS1.suptitle('Permutation Feature Importance', fontsize=FONT_TITLE, fontweight='bold', y=TITLE_GAP)
+                            figS1.suptitle('Permutation Feature Importance', fontsize=fS1['title'], fontweight='bold', y=TITLE_GAP)
                             figS1.tight_layout(rect=[0,0,1,0.95])
                             bufS1 = io.BytesIO(); figS1.savefig(bufS1, format='png', dpi=DPI, bbox_inches='tight'); bufS1.seek(0)
                             figure_buffers_png['Fig_S1_Permutation_Importance.png'] = bufS1
@@ -1221,6 +1252,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                         
                         # --- Fig 7: PCA Biplot ---
                         if n_responses >= 2:
+                            f7 = get_fonts('fig7')
                             fig7_w = get_width('fig7')
                             fig7_w_actual = SINGLE_COL*1.15 if fig7_w==SINGLE_COL else fig7_w*0.80
                             fig7, ax7 = plt.subplots(figsize=(fig7_w_actual, fig7_w_actual*1.20))
@@ -1250,8 +1282,8 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                         text_x, text_y = lx*1.40, ly*1.40; break
                                 label_positions.append((text_x, text_y))
                                 ax7.text(text_x, text_y, resp, fontsize=6, color='darkred', fontweight='bold', ha='center', va='center')
-                            ax7.set_xlabel(f'PC1 ({pca_var_explained[0]:.1%} variance)', fontsize=FONT_BASE, fontweight='normal')
-                            ax7.set_ylabel(f'PC2 ({pca_var_explained[1]:.1%} variance)', fontsize=FONT_BASE, fontweight='normal')
+                            ax7.set_xlabel(f'PC1 ({pca_var_explained[0]:.1%} variance)', fontsize=f7['base'], fontweight='normal')
+                            ax7.set_ylabel(f'PC2 ({pca_var_explained[1]:.1%} variance)', fontsize=f7['base'], fontweight='normal')
                             ax7.axhline(y=0, color='gray', linewidth=0.5); ax7.axvline(x=0, color='gray', linewidth=0.5)
                             ax7.grid(True, alpha=0.3)
                             ncol_legend = min(5, n_unique)
@@ -1260,7 +1292,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                        mode='expand', borderaxespad=0, title='Groups', title_fontsize=5.5,
                                        handletextpad=0.3, columnspacing=0.5)
                             fig7.suptitle('PCA Biplot — Treatment Groups & Response Loadings',
-                                         fontsize=FONT_TITLE, fontweight='bold', y=TITLE_GAP+0.06)
+                                         fontsize=f7['title'], fontweight='bold', y=TITLE_GAP+0.06)
                             fig7.tight_layout(rect=[0,0,1,0.88])
                             buf7 = io.BytesIO(); fig7.savefig(buf7, format='png', dpi=DPI, bbox_inches='tight'); buf7.seek(0)
                             figure_buffers_png['Fig_7_PCA_Biplot.png'] = buf7
@@ -1270,8 +1302,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                             
                             plt.close('all')
                             figure_buffers = {**figure_buffers_png, **figure_buffers_pdf}
-                            progress_bar.progress(90, text="Preparing display...")
-                        
+                            progress_bar.progress(90, text="Preparing display...")                        
                         # ============================================================
                         # DISPLAY RESULTS
                         # ============================================================
