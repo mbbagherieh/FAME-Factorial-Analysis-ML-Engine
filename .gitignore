@@ -1,4 +1,9 @@
 __pycache__/
-.ipynb_checkpoints/
 *.pyc
-.env
+*.pyo
+*.log
+.DS_Store
+*.zip
+.Rhistory
+.RData
+.ipynb_checkpoints/

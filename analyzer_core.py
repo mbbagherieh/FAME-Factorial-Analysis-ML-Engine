@@ -11,8 +11,9 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.stats import t as t_dist, shapiro, levene, kruskal, pearsonr, studentized_range
+from scipy.stats import t as t_dist, shapiro, levene, kruskal, pearsonr, studentized_range, ttest_rel
 from statsmodels.formula.api import ols
+import statsmodels.formula.api as smf
 import statsmodels.api as sm
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
@@ -33,6 +34,20 @@ import subprocess
 import tempfile
 import os
 
+# ─────────────────────────────────────────────────────────────
+# Shared helper: correlation-style standardization with ddof=1
+# Used by PCA, beta coefficients, and any user-facing
+# standardization to ensure eigenvalues sum to p and that
+# variance estimates are consistent across the pipeline.
+# ─────────────────────────────────────────────────────────────
+def standardize_ddof1(A):
+    """Column-wise Z-score with sample SD (ddof=1)."""
+    A = np.asarray(A, dtype=float)
+    mu = A.mean(axis=0, keepdims=True)
+    sd = A.std(axis=0, ddof=1, keepdims=True)
+    sd = np.where(sd == 0, 1.0, sd)   # protect constant columns
+    return (A - mu) / sd
+    
 # Optional: R interface for correct post-hoc tests (via subprocess)
 R_AVAILABLE = False
 _R_ERROR_MSG = ""
@@ -52,6 +67,7 @@ try:
 except Exception as e:
     _R_ERROR_MSG = str(e)[:200]
 
+# R_AVAILABLE = False  # TEMPORARY — force Python Piepho for testing
 
 def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
                          df_prelim, df_pearson, outlier_results,
@@ -60,7 +76,8 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
                          shap_imp, perm_imp, model_comparison, df_mc,
                          beta, beta_ci_lower, beta_ci_upper,
                          pca, pca_var_explained, df_pca_summary, df_pca_loadings,
-                         resid_corr, pca_loadings, cv_folds):
+                         resid_corr, pca_loadings, cv_folds,
+                         factor_type_log=None):      # ← add this
     """Generate a comprehensive text report of all analyses."""
     
     report = []
@@ -74,7 +91,12 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
     report.append(f"Factors: {', '.join(FACTOR_COLS)}")
     report.append(f"Responses: {', '.join(RESPONSE_COLS)}")
     report.append(f"Observations: {len(df)}")
-    report.append(sep)
+    if factor_type_log:
+        report.append("Factor type handling:")
+        for f, status in factor_type_log.items():
+            report.append(f"  {f}: {status}")
+        report.append(sep)
+   
     
     # ── 1. DESCRIPTIVE STATISTICS ──
     report.append("\n" + "=" * 80)
@@ -191,6 +213,11 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
     report.append("\n\n" + "=" * 80)
     report.append("5. POST-HOC MEAN COMPARISONS")
     report.append("=" * 80)
+    report.append(f"Method: {posthoc_method}  |  "
+                  f"Engine: {'R agricolae (HSD.test/LSD.test)' if R_AVAILABLE else 'Python fallback (significance matrix)'}")
+    if not R_AVAILABLE:
+        report.append("Note: Letter groupings (a, b, ab, …) are not produced by the Python "
+                      "fallback; pairwise significance is reported instead.")
     
     for resp in RESPONSE_COLS:
         if resp in posthoc_dict and posthoc_dict[resp]['groups']:
@@ -200,6 +227,10 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
             report.append("-" * 65)
             for trt, info in ph['groups'].items():
                 report.append(f"{trt:<35} {info['mean']:>10.4f} {info['sd']:>10.4f} {info['letter']:>8}")
+            
+            if 'sig_matrix' in ph and len(ph['sig_matrix']) > 0:
+                report.append(f"\n  Pairwise Significance Matrix:")
+                report.append(ph['sig_matrix'].to_string(index=False))
     
     # ── 6. SHAP FEATURE IMPORTANCE ──
     report.append("\n\n" + "=" * 80)
@@ -235,13 +266,24 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
     report.append(f"8. MODEL PERFORMANCE COMPARISON ({cv_folds}-Fold CV R²)")
     report.append("=" * 80)
     report.append("\nTable: Cross-validated R² (mean ± std)")
-    report.append(df_mc.round(3).to_string(index=False))
+    perf_cols = ['Response', 'RF_R2_mean', 'RF_R2_std', 'LR_R2_mean', 'LR_R2_std', 
+                'GPR_R2_mean', 'GPR_R2_std', 'Best']
+    report.append(df_mc[perf_cols].round(3).to_string(index=False))
+    
+    report.append("\n\nTable: Pairwise Model Comparisons (Paired t-test on CV folds)")
+    if 'RF_vs_LR' in df_mc.columns:
+        test_cols = ['Response', 'RF_vs_LR', 'RF_vs_GPR', 'LR_vs_GPR']
+        report.append(df_mc[test_cols].to_string(index=False))
+        report.append("\n  * p < 0.05, ** p < 0.01, *** p < 0.001, ns = not significant")
+    else:
+        report.append("  Not available.")
     
     report.append("\nInterpretation:")
     for _, row in df_mc.iterrows():
         report.append(f"  • {row['Response']}: Best model = {row['Best']} "
                      f"(RF={row['RF_R2_mean']:.3f}, LR={row['LR_R2_mean']:.3f}, GPR={row['GPR_R2_mean']:.3f})")
-    
+        if 'RF_vs_LR' in row:
+            report.append(f"      {row['RF_vs_LR']}  |  {row['RF_vs_GPR']}  |  {row['LR_vs_GPR']}")    
     # ── 9. STANDARDIZED BETA COEFFICIENTS ──
     report.append("\n\n" + "=" * 80)
     report.append("9. STANDARDIZED REGRESSION COEFFICIENTS (β) with 95% Bootstrap CI")
@@ -249,7 +291,7 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
     
     for i, resp in enumerate(RESPONSE_COLS):
         report.append(f"\n--- {resp} ---")
-        report.append(f"{'Factor':<20} {'β':>10} {'95% CI Lower':>14} {'95% CI Upper':>14} {'Significant?':>12}")
+        report.append(f"{'Factor':<20} {'β':>10} {'95% CI Lower':>14} {'95% CI Upper':>14} {'95% CI ≠ 0':>12}")
         report.append("-" * 70)
         for j, factor in enumerate(FACTOR_COLS):
             sig = "Yes" if (beta_ci_lower[j,i] > 0 or beta_ci_upper[j,i] < 0) else "No"
@@ -338,7 +380,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
     Main analyzer function.
     
     Parameters:
-    - n_factors_default: number of factor inputs to show (2, 3, 4, or 5)
+    - n_factors_default: number of factor inputs to show (1, 2, 3, 4, or 5)
     - default_factor_names: list of default factor names
     - default_responses: string with default response names (one per line)
     - app_title: title for the app
@@ -395,11 +437,12 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
     
     st.sidebar.subheader("Advanced Settings")
     n_categories = st.sidebar.slider(
-        "ANOVA categories per factor",
+        "Continuous-factor binning",
         min_value=2, max_value=5, value=3,
-        help="Number of bins/categories to split each continuous factor into for ANOVA. "
-             "For example, 3 creates 'Low', 'Medium', 'High' groups. "
-             "Higher values give finer resolution but may create sparse groups."
+        help="Number of bins used ONLY for continuous covariates (factors with more than "
+             "10 unique values). Designed treatment factors — such as concentration levels "
+             "or genotype — are always analyzed at their natural levels and are NOT affected "
+             "by this setting."
     )
     cv_folds = st.sidebar.slider(
         "Cross-validation folds",
@@ -528,6 +571,72 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                     
                     with st.expander("📊 Data Preview", expanded=False):
                         st.dataframe(df[FACTOR_COLS + RESPONSE_COLS].head(10))
+                        
+                        st.markdown("---")
+                        st.markdown("#### Distribution by Treatment Group")
+                        
+                        # Create treatment labels for grouping
+                        df_preview = df.copy()
+                        if n_factors == 1:
+                            try:
+                                df_preview['_group_'] = df_preview[FACTOR_COLS[0]].round(1).astype(str)
+                            except (TypeError, AttributeError):
+                                df_preview['_group_'] = df_preview[FACTOR_COLS[0]].astype(str)
+                        else:
+                            parts = []
+                            for f in FACTOR_COLS:
+                                try:
+                                    parts.append(df_preview[f].round(1).astype(str))
+                                except (TypeError, AttributeError):
+                                    parts.append(df_preview[f].astype(str))
+                            df_preview['_group_'] = parts[0]
+                            for p in parts[1:]:
+                                df_preview['_group_'] = df_preview['_group_'] + '_' + p
+                        
+                        # Sort groups naturally
+                        group_order = sorted(df_preview['_group_'].unique(), 
+                                           key=lambda x: float(x.split('_')[0]) if x.split('_')[0].replace('.','').replace('-','').isdigit() else x)
+                        
+                        n_cols_box = min(3, n_responses)
+                        n_rows_box = (n_responses + n_cols_box - 1) // n_cols_box
+                        fig_box, axes_box = plt.subplots(n_rows_box, n_cols_box, 
+                                                         figsize=(3.5 * n_cols_box, 3 * n_rows_box))
+                        if n_responses == 1:
+                            axes_box = np.array([axes_box])
+                        axes_box = axes_box.flatten()
+                        
+                        for idx, resp in enumerate(RESPONSE_COLS):
+                            ax = axes_box[idx]
+                            plot_data = [df_preview[df_preview['_group_'] == g][resp].dropna().values 
+                                        for g in group_order]
+                            bp = ax.boxplot(plot_data, tick_labels=group_order, patch_artist=True,
+                                           widths=0.6, showfliers=False)
+                            for patch in bp['boxes']:
+                                patch.set_facecolor('#5DADE2')
+                                patch.set_alpha(0.7)
+                            
+                            # Add jittered points
+                            for gi, g in enumerate(group_order):
+                                vals = df_preview[df_preview['_group_'] == g][resp].dropna().values
+                                if len(vals) > 0:
+                                    jitter = np.random.normal(gi + 1, 0.04, len(vals))
+                                    ax.scatter(jitter, vals, color='black', s=12, alpha=0.5, 
+                                              edgecolors='none', zorder=5)
+                            
+                            ax.set_title(resp, fontsize=10, fontweight='bold')
+                            ax.set_ylabel(resp if idx % n_cols_box == 0 else '', fontsize=8)
+                            ax.tick_params(axis='x', rotation=45, labelsize=7)
+                            ax.tick_params(axis='y', labelsize=7)
+                            ax.grid(True, axis='y', alpha=0.3)
+                        
+                        for idx in range(n_responses, len(axes_box)):
+                            axes_box[idx].set_visible(False)
+                        
+                        fig_box.suptitle('Response Distributions by Treatment', fontsize=11, fontweight='bold', y=1.02)
+                        fig_box.tight_layout()
+                        st.pyplot(fig_box)
+                        plt.close(fig_box)
+                        df_preview.drop(columns=['_group_'], inplace=True)
                     
                     if st.button("🚀 Run Full Analysis", type="primary", use_container_width=True):
                         
@@ -535,17 +644,40 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                         for resp in RESPONSE_COLS:
                             df[resp] = pd.to_numeric(df[resp], errors='coerce')
                         
-                        # ---- Categorical bins ----
-                        cat_labels = ['Low', 'Medium', 'High'][:n_categories]
+                        # ---- Factor type handling ----
+                        # Designed treatment factors (few unique levels) are treated as categorical
+                        # at their natural levels. Only genuinely continuous covariates (many unique
+                        # values) are optionally binned into quantile categories for ANOVA.
+                        AUTO_CATEGORICAL_THRESHOLD = 10
+                        _ALL_CAT_LABELS = ['Low', 'Medium', 'High', 'Very High', 'Extreme']
+                        cat_labels = _ALL_CAT_LABELS[:n_categories]
+                        if n_categories > len(_ALL_CAT_LABELS):
+                            cat_labels = [f'Level {i+1}' for i in range(n_categories)]
+
+                        factor_type_log = {}   # records how each factor was treated (for the report)
+
                         for factor in FACTOR_COLS:
                             unique_vals = df[factor].dropna().unique()
-                            if df[factor].dtype == 'object' or len(unique_vals) <= n_categories:
+                            n_unique = len(unique_vals)
+
+                            if df[factor].dtype == 'object' or n_unique <= AUTO_CATEGORICAL_THRESHOLD:
+                                # Categorical: designed treatment levels preserved
                                 df[f'{factor}_cat'] = df[factor].astype(str)
+                                factor_type_log[factor] = f'categorical ({n_unique} levels, natural)'
                             else:
+                                # Continuous: optionally binned
                                 try:
-                                    df[f'{factor}_cat'] = pd.qcut(df[factor], q=n_categories, labels=cat_labels)
+                                    df[f'{factor}_cat'] = pd.qcut(df[factor], q=n_categories,
+                                                              labels=cat_labels, duplicates='drop')
+                                    factor_type_log[factor] = f'continuous (binned into {n_categories} quantile groups)'
                                 except ValueError:
                                     df[f'{factor}_cat'] = pd.cut(df[factor], bins=n_categories, labels=cat_labels)
+                                    factor_type_log[factor] = f'continuous (binned into {n_categories} equal-width groups)'
+
+                        # Display factor type decisions to the user
+                        with st.expander("ℹ️ Factor type detection", expanded=False):
+                            for f, status in factor_type_log.items():
+                                st.write(f"**{f}**: {status}")
                         
                         # Encode categorical factors for ML
                         df_encoded = df.copy()
@@ -586,6 +718,9 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                 normality = "Normal" if p_shapiro >= 0.05 else "Non-normal"
                             except:
                                 stat_shapiro, p_shapiro, normality = np.nan, np.nan, "Error"
+                            # TEMPORARY DEBUG
+                            #st.write(f"DEBUG: resp={resp}, n_factors={n_factors}, FACTOR_COLS={FACTOR_COLS}")
+                           
                             try:
                                 if n_factors >= 2:
                                     f1, f2 = FACTOR_COLS[0], FACTOR_COLS[1]
@@ -597,6 +732,15 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                     else:
                                         stat_levene, p_levene, homogeneity = np.nan, np.nan, "N/A"
                                     df.drop(columns=['_group_'], inplace=True)
+                                elif n_factors == 1:
+                                    f1 = FACTOR_COLS[0]
+                                    cat_col = f'{f1}_cat'
+                                    groups = [g[resp].dropna().values for _, g in df.groupby(cat_col) if len(g[resp].dropna()) >= 2]
+                                    if len(groups) >= 2:
+                                        stat_levene, p_levene = levene(*groups)
+                                        homogeneity = "Equal" if p_levene >= 0.05 else "Unequal"
+                                    else:
+                                        stat_levene, p_levene, homogeneity = np.nan, np.nan, "N/A"
                                 else:
                                     stat_levene, p_levene, homogeneity = np.nan, np.nan, "N/A"
                             except:
@@ -783,19 +927,65 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                                            min_samples_leaf=2, random_state=random_state, n_jobs=-1)
                                 rf_cv = cross_val_score(rf, X_ml, Y_ml[:,idx], cv=cv, scoring='r2')
                                 lr_cv = cross_val_score(LinearRegression(), X_ml, Y_ml[:,idx], cv=cv, scoring='r2')
-                                gpr = GaussianProcessRegressor(kernel=RBF(length_scale=20)+WhiteKernel(noise_level=0.01),
-                                                              n_restarts_optimizer=10, random_state=random_state)
+                                from sklearn.pipeline import make_pipeline
+                                gpr = make_pipeline(
+                                    StandardScaler(),
+                                    GaussianProcessRegressor(
+                                        kernel=RBF(length_scale=1.0, length_scale_bounds=(0.1, 10.0))
+                                             + WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-3, 1.0)),
+                                        n_restarts_optimizer=10,
+                                        random_state=random_state)
+                                )
                                 gpr_cv = cross_val_score(gpr, X_ml, Y_ml[:,idx], cv=cv, scoring='r2')
+                                
+                                # Determine best model by mean R²
                                 best = 'RF' if rf_cv.mean()>=max(lr_cv.mean(),gpr_cv.mean()) else \
                                        'LR' if lr_cv.mean()>=max(rf_cv.mean(),gpr_cv.mean()) else 'GPR'
-                                model_comparison.append({'Response':resp,'RF_R2_mean':rf_cv.mean(),'RF_R2_std':rf_cv.std(),
-                                                        'LR_R2_mean':lr_cv.mean(),'LR_R2_std':lr_cv.std(),
-                                                        'GPR_R2_mean':gpr_cv.mean(),'GPR_R2_std':gpr_cv.std(),'Best':best})
+                                
+                                # Paired t-tests on fold scores
+                                def format_ttest(a, b, name_a, name_b):
+                                    """Perform paired t-test and return formatted string."""
+                                    try:
+                                        t_stat, p_val = ttest_rel(a, b)
+                                        if p_val < 0.001:
+                                            sig = f'*** (p={p_val:.4f})'
+                                        elif p_val < 0.01:
+                                            sig = f'** (p={p_val:.4f})'
+                                        elif p_val < 0.05:
+                                            sig = f'* (p={p_val:.4f})'
+                                        else:
+                                            sig = f'ns (p={p_val:.4f})'
+                                        if a.mean() > b.mean():
+                                            return f'{name_a} > {name_b}: {sig}'
+                                        else:
+                                            return f'{name_b} > {name_a}: {sig}'
+                                    except:
+                                        return 'N/A'
+                                
+                                test_rf_lr = format_ttest(rf_cv, lr_cv, 'RF', 'LR')
+                                test_rf_gpr = format_ttest(rf_cv, gpr_cv, 'RF', 'GPR')
+                                test_lr_gpr = format_ttest(lr_cv, gpr_cv, 'LR', 'GPR')
+                                
+                                model_comparison.append({
+                                    'Response': resp,
+                                    'RF_R2_mean': rf_cv.mean(), 'RF_R2_std': rf_cv.std(),
+                                    'LR_R2_mean': lr_cv.mean(), 'LR_R2_std': lr_cv.std(),
+                                    'GPR_R2_mean': gpr_cv.mean(), 'GPR_R2_std': gpr_cv.std(),
+                                    'Best': best,
+                                    'RF_vs_LR': test_rf_lr,
+                                    'RF_vs_GPR': test_rf_gpr,
+                                    'LR_vs_GPR': test_lr_gpr
+                                })
                             except Exception as ex:
                                 st.warning(f"CV failed for {resp}: {str(ex)[:80]}")
-                                model_comparison.append({'Response':resp,'RF_R2_mean':np.nan,'RF_R2_std':np.nan,
-                                                        'LR_R2_mean':np.nan,'LR_R2_std':np.nan,
-                                                        'GPR_R2_mean':np.nan,'GPR_R2_std':np.nan,'Best':'Error'})
+                                model_comparison.append({
+                                    'Response': resp,
+                                    'RF_R2_mean': np.nan, 'RF_R2_std': np.nan,
+                                    'LR_R2_mean': np.nan, 'LR_R2_std': np.nan,
+                                    'GPR_R2_mean': np.nan, 'GPR_R2_std': np.nan,
+                                    'Best': 'Error',
+                                    'RF_vs_LR': 'N/A', 'RF_vs_GPR': 'N/A', 'LR_vs_GPR': 'N/A'
+                                })
                         df_mc = pd.DataFrame(model_comparison)
                         
                         progress_bar.progress(45, text="Computing standardized coefficients...")
@@ -819,37 +1009,43 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                         # ---- MORF ----
                         try:
                             if n_responses >= 2:
-                                mor = MultiOutputRegressor(RandomForestRegressor(n_estimators=rf_estimators, max_depth=None,
-                                                           min_samples_leaf=2, random_state=random_state, n_jobs=-1))
-                                mor.fit(X_ml, Y_ml)
+                                # Native multi-output Random Forest: shares tree structure
+                                # across responses, unlike MultiOutputRegressor which fits
+                                # one independent model per response.
+                                mor = RandomForestRegressor(
+                                    n_estimators=rf_estimators, max_depth=None,
+                                    min_samples_leaf=2, random_state=random_state, n_jobs=-1)
+                                mor.fit(X_ml, Y_ml)                     # natively multi-output
                                 resid_corr = np.corrcoef((Y_ml - mor.predict(X_ml)).T)
                             else:
                                 resid_corr = np.array([[1.0]])
-                        except:
+                        except Exception:
                             resid_corr = np.eye(max(n_responses, 1))
                         
                         progress_bar.progress(60, text="Running PCA...")
                         
-                        # ---- PCA ----
-                        scaler_pca = StandardScaler()
-                        Y_scaled = scaler_pca.fit_transform(Y_ml)
-                        pca = PCA(n_components=min(5, n_responses))
+                        # ---- PCA (correlation-based, ddof=1) ----
+                        # Manual standardization with ddof=1 so that the covariance
+                        # matrix equals the correlation matrix and eigenvalues sum to p.
+                        Y_scaled = standardize_ddof1(Y_ml)
+                        pca = PCA(n_components=n_responses)   # extract ALL components
                         pca_scores = pca.fit_transform(Y_scaled)
                         pca_loadings = pca.components_.T
                         pca_var_explained = pca.explained_variance_ratio_
+                        # pca.explained_variance_ now sums to n_responses, ratios sum to 1.
                         
                         df_pca_summary = pd.DataFrame([{
-                            'Component': f'PC{i+1}',
-                            'Eigenvalue': f"{pca.explained_variance_[i]:.3f}",
-                            'Variance (%)': f"{pca_var_explained[i]*100:.1f}",
+                            'Component':      f'PC{i+1}',
+                            'Eigenvalue':     f"{pca.explained_variance_[i]:.3f}",
+                            'Variance (%)':   f"{pca_var_explained[i]*100:.1f}",
                             'Cumulative (%)': f"{np.cumsum(pca_var_explained)[i]*100:.1f}"
-                        } for i in range(min(5,n_responses))])
+                        } for i in range(n_responses)])   # all components, not just 5
                         
                         pca_loading_rows = []
                         for i, resp in enumerate(RESPONSE_COLS):
                             row = {'Response': resp}
-                            for j in range(min(3,n_responses)):
-                                row[f'PC{j+1}'] = round(pca_loadings[i,j], 3)
+                            for j in range(n_responses):          # expose all PCs
+                                row[f'PC{j+1}'] = round(pca_loadings[i, j], 3)
                             pca_loading_rows.append(row)
                         df_pca_loadings = pd.DataFrame(pca_loading_rows)
                         
@@ -859,7 +1055,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                         # POST-HOC (via R's agricolae subprocess)
                         # ============================================================
                         posthoc_dict = {}
-                        if n_factors >= 2:
+                        if n_factors >= 1:
                             # Create treatment labels from ALL factors
                             treatment_parts = []
                             for f in FACTOR_COLS:
@@ -870,7 +1066,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                             df['Treatment'] = treatment_parts[0]
                             for part in treatment_parts[1:]:
                                 df['Treatment'] = df['Treatment'] + '_' + part
-                            
+                        
                             if not R_AVAILABLE:
                                 st.warning(f"⚠️ R/agricolae not available. Using Python-based CLD. ({_R_ERROR_MSG})")
                             
@@ -937,56 +1133,100 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                             for path in [csv_path, r_script_path, f"{csv_path}.groups.csv",
                                                         f"{csv_path}.mse.txt", f"{csv_path}.df.txt"]:
                                                 if os.path.exists(path): os.remove(path)
+
                                     else:
-                                        # Python fallback
-                                        group_stats = df.groupby('Treatment')[resp].agg(['mean','std','count'])
+                            
+                                        # Python fallback — significance matrix heatmap
+                                        resp_data = df[['Treatment', resp]].dropna().copy()
+                                        group_stats = resp_data.groupby('Treatment')[resp].agg(['mean', 'std', 'count'])
                                         group_means = group_stats['mean'].sort_values(ascending=False)
-                                        group_sd = group_stats.loc[group_means.index,'std']
-                                        group_n = group_stats.loc[group_means.index,'count']
-                                        mse = 0.001; df_error = 27
-                                        if resp in full_anova_tables:
-                                            atbl = full_anova_tables[resp]
-                                            mse = atbl.loc['Residual','sum_sq']/atbl.loc['Residual','df']
-                                            df_error = int(atbl.loc['Residual','df'])
-                                        n_per_group = int(group_n.iloc[0]) if len(group_n)>0 else 3
+                                        group_sd = group_stats.loc[group_means.index, 'std']
+                                        group_n = group_stats.loc[group_means.index, 'count']
+                                        
+                                        # Fit one-way ANOVA on Treatment to get correct MSE and df
+                                        model_1way = smf.ols(f'Q("{resp}") ~ C(Treatment)', data=resp_data).fit()
+                                        anova_1way = sm.stats.anova_lm(model_1way, typ=2)
+                                        mse = anova_1way.loc['Residual', 'sum_sq'] / anova_1way.loc['Residual', 'df']
+                                        df_error = int(anova_1way.loc['Residual', 'df'])
+                                        
                                         groups_list = list(group_means.index)
                                         n_grp = len(groups_list)
                                         means_array = group_means.values
+                                        n_vals = group_n.values
+                                        
+                                        # Critical difference (average across pairs for display)
+                                        cd_values = []
+                                        for i in range(n_grp):
+                                            for j in range(i+1, n_grp):
+                                                se_diff = np.sqrt(mse * (1.0/n_vals[i] + 1.0/n_vals[j]))
+                                                if posthoc_method == "Tukey's HSD":
+                                                    q_crit = studentized_range.ppf(0.95, n_grp, df_error)
+                                                    cd_values.append(q_crit * se_diff)
+                                                else:
+                                                    t_crit = t_dist.ppf(0.975, df_error)
+                                                    cd_values.append(t_crit * se_diff)
+                                        critical_diff = np.mean(cd_values) if cd_values else 0.0
+                                        
                                         if posthoc_method == "Tukey's HSD":
-                                            q_crit = studentized_range.ppf(0.95, n_grp, df_error)
-                                            critical_diff = q_crit*np.sqrt(mse/n_per_group)
                                             method_name = "Tukey's HSD"
                                         else:
-                                            critical_diff = t_dist.ppf(0.975,df_error)*np.sqrt(2*mse/n_per_group)
                                             method_name = "Fisher's LSD"
-                                        sig_matrix = np.zeros((n_grp,n_grp), dtype=bool)
+                                        
+                                        # Build p-value matrix
+                                        p_matrix = np.ones((n_grp, n_grp))
                                         for i in range(n_grp):
                                             for j in range(n_grp):
-                                                if i!=j: sig_matrix[i,j] = abs(means_array[i]-means_array[j])>critical_diff
-                                        sorted_order = np.argsort(-means_array)
-                                        group_letters = [set() for _ in range(n_grp)]
-                                        group_letters[sorted_order[0]].add('a')
-                                        for rank_pos in range(1,n_grp):
-                                            group_idx = sorted_order[rank_pos]
-                                            for higher_rank in range(rank_pos):
-                                                if not sig_matrix[group_idx, sorted_order[higher_rank]]:
-                                                    group_letters[group_idx].update(group_letters[sorted_order[higher_rank]])
-                                            if len(group_letters[group_idx])==0:
-                                                all_used = set()
-                                                for s in group_letters: all_used.update(s)
-                                                for l_code in range(26):
-                                                    l_char = chr(ord('a')+l_code)
-                                                    if l_char not in all_used:
-                                                        group_letters[group_idx].add(l_char); break
-                                        letter_result = [''.join(sorted(list(l))) for l in group_letters]
+                                                if i != j:
+                                                    se_diff = np.sqrt(mse * (1.0/n_vals[i] + 1.0/n_vals[j]))
+                                                    t_stat = abs(means_array[i] - means_array[j]) / se_diff
+                                                    if posthoc_method == "Tukey's HSD":
+                                                        q_stat = t_stat * np.sqrt(2)
+                                                        p_matrix[i, j] = 1.0 - studentized_range.cdf(q_stat, n_grp, df_error)
+                                                    else:
+                                                        p_matrix[i, j] = 2.0 * (1.0 - t_dist.cdf(t_stat, df_error))
+                                        
+                                        # Store as dict with p-values and significance
+                                        sig_results = []
+                                        for i in range(n_grp):
+                                            for j in range(i+1, n_grp):
+                                                p_val = p_matrix[i, j]
+                                                if p_val < 0.001:
+                                                    sig_str = '***'
+                                                elif p_val < 0.01:
+                                                    sig_str = '**'
+                                                elif p_val < 0.05:
+                                                    sig_str = '*'
+                                                else:
+                                                    sig_str = 'ns'
+                                                sig_results.append({
+                                                    'Group_1': groups_list[i],
+                                                    'Mean_1': round(means_array[i], 4),
+                                                    'Group_2': groups_list[j],
+                                                    'Mean_2': round(means_array[j], 4),
+                                                    'Diff': round(abs(means_array[i] - means_array[j]), 4),
+                                                    'p-value': round(p_val, 4),
+                                                    'Sig.': sig_str
+                                                })
+                                        
+                                        df_sig = pd.DataFrame(sig_results)
+                                        
+                                        # Also build groups dict for display consistency
                                         sorted_groups = sorted(groups_list, key=lambda g: group_means[g], reverse=True)
-                                        posthoc_dict[resp] = {'method': method_name, 'critical_diff': critical_diff, 'groups': {}}
+                                        posthoc_dict[resp] = {
+                                            'method': method_name,
+                                            'critical_diff': critical_diff,
+                                            'groups': {},
+                                            'sig_matrix': df_sig
+                                        }
                                         for g in sorted_groups:
                                             idx = groups_list.index(g)
-                                            posthoc_dict[resp]['groups'][g] = {'mean': group_means[g], 'sd': group_sd[g], 'letter': letter_result[idx]}
+                                            posthoc_dict[resp]['groups'][g] = {
+                                                'mean': group_means[g],
+                                                'sd': group_sd[g],
+                                                'letter': ''
+                                            }
                                 except Exception as ex:
-                                    posthoc_dict[resp] = {'method': posthoc_method, 'critical_diff': np.nan, 'groups': {}, 'error': str(ex)[:150]}
-                        
+                                    posthoc_dict[resp] = {'method': posthoc_method, 'critical_diff': np.nan, 'groups': {}, 'error': str(ex)[:150]}                        
                         # ============================================================
                         # GENERATE ALL FIGURES
                         # ============================================================
@@ -1096,7 +1336,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                             ax.set_title(resp, fontsize=f2['title'], fontweight='bold')
                             for i in range(n_factors-1): ax.axhline(y=i+0.5, color='gray', linestyle='--', linewidth=0.3, alpha=0.5)
                         for idx in range(n_responses, len(axes2)): axes2[idx].set_visible(False)
-                        fig2.suptitle('SHAP Beeswarm Plots\n(Blue=High, Red=Low)', fontsize=f2['title'], fontweight='bold', y=TITLE_GAP)
+                        fig2.suptitle('SHAP Beeswarm Plots\n(Blue=Low, Red=High)', fontsize=f2['title'], fontweight='bold', y=TITLE_GAP)
                         fig2.tight_layout(rect=[0,0,1,0.93])
                         buf2 = io.BytesIO(); fig2.savefig(buf2, format='png', dpi=DPI, bbox_inches='tight'); buf2.seek(0)
                         figure_buffers_png['Fig_2_SHAP_Beeswarm.png'] = buf2
@@ -1356,12 +1596,23 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                 for resp in RESPONSE_COLS:
                                     if resp in posthoc_dict and posthoc_dict[resp]['groups']:
                                         cd = posthoc_dict[resp]['critical_diff']
-                                        with st.expander(f"{resp} (CD = {cd:.4f})"):
-                                            rows = [{'Treatment':t, 'Mean':f"{i['mean']:.4f}",
-                                                    'SD':f"{i['sd']:.4f}", 'Group':i['letter']}
-                                                   for t,i in posthoc_dict[resp]['groups'].items()]
-                                            st.dataframe(pd.DataFrame(rows), use_container_width=True)
-                            else: st.info("Requires at least 2 factors.")
+                                        # Check if we have a significance matrix (Python fallback)
+                                        if 'sig_matrix' in posthoc_dict[resp]:
+                                            with st.expander(f"{resp} (CD = {cd:.4f})"):
+                                                st.markdown("**Treatment Means**")
+                                                rows = [{'Treatment':t, 'Mean':f"{i['mean']:.4f}",
+                                                        'SD':f"{i['sd']:.4f}"}
+                                                       for t,i in posthoc_dict[resp]['groups'].items()]
+                                                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                                                st.markdown("**Pairwise Significance Matrix**")
+                                                st.dataframe(posthoc_dict[resp]['sig_matrix'], use_container_width=True)
+                                        else:
+                                            with st.expander(f"{resp} (CD = {cd:.4f})"):
+                                                rows = [{'Treatment':t, 'Mean':f"{i['mean']:.4f}",
+                                                        'SD':f"{i['sd']:.4f}", 'Group':i['letter']}
+                                                       for t,i in posthoc_dict[resp]['groups'].items()]
+                                                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                            else: st.info("Post-hoc comparisons not available.")
                         
                         with tab3:
                             st.subheader("SHAP Feature Importance (%)")
@@ -1369,7 +1620,16 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                                        columns=FACTOR_COLS, index=RESPONSE_COLS).round(1)
                             st.dataframe(shap_pct_df, use_container_width=True)
                             st.subheader(f"Model Comparison ({cv_folds}-Fold CV R²)")
-                            st.dataframe(df_mc.round(3), use_container_width=True)
+                            # Display performance metrics
+                            perf_cols = ['Response', 'RF_R2_mean', 'RF_R2_std', 'LR_R2_mean', 'LR_R2_std', 
+                                        'GPR_R2_mean', 'GPR_R2_std', 'Best']
+                            st.dataframe(df_mc[perf_cols].round(3), use_container_width=True)
+                            
+                            # Display pairwise statistical tests
+                            st.markdown("**Pairwise Model Comparisons (Paired t-test on CV folds)**")
+                            test_cols = ['Response', 'RF_vs_LR', 'RF_vs_GPR', 'LR_vs_GPR']
+                            st.dataframe(df_mc[test_cols], use_container_width=True)
+                            st.caption("* p < 0.05, ** p < 0.01, *** p < 0.001, ns = not significant")
                             st.subheader("Standardized Regression Coefficients (β)")
                             beta_display = pd.DataFrame(beta, index=FACTOR_COLS, columns=RESPONSE_COLS).round(4)
                             st.dataframe(beta_display, use_container_width=True)
@@ -1412,7 +1672,8 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                 shap_imp, perm_imp, model_comparison, df_mc,
                                 beta, beta_ci_lower, beta_ci_upper,
                                 pca, pca_var_explained, df_pca_summary, df_pca_loadings,
-                                resid_corr, pca_loadings, cv_folds
+                                resid_corr, pca_loadings, cv_folds,
+                                factor_type_log=factor_type_log       # ← add this
                             )
                             
                             zip_buffer = io.BytesIO()
