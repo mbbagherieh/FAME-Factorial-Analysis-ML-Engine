@@ -33,7 +33,7 @@ streamlit run Home.py
 ```
 License
 
-MIT License
+GPL-3 License
 Citation
 
 [Citation to be added after publication]
