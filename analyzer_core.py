@@ -3,8 +3,8 @@
 # analyzer_core.py — Shared analysis engine
 # Do NOT run this file directly. Import from wrapper scripts.
 # 
-# License: MIT
-# Repository: https://github.com/mbbagherieh/FAME-Factorial-Analysis-ML-Engine-
+# License: GPL-3
+# Repository: https://github.com/mbbagherieh/FAME-streamlit-ml-analysis
 # ============================================================
 
 import streamlit as st
@@ -77,7 +77,9 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
                          beta, beta_ci_lower, beta_ci_upper,
                          pca, pca_var_explained, df_pca_summary, df_pca_loadings,
                          resid_corr, pca_loadings, cv_folds,
-                         factor_type_log=None):      # ← add this
+                         factor_type_log=None,
+                         source_file_name=None, n_rows_raw=None,
+                         n_rows_anova=None, n_rows_ml=None, n_rows_dropped=None):      # ← add this
     """Generate a comprehensive text report of all analyses."""
     
     report = []
@@ -91,6 +93,12 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
     report.append(f"Factors: {', '.join(FACTOR_COLS)}")
     report.append(f"Responses: {', '.join(RESPONSE_COLS)}")
     report.append(f"Observations: {len(df)}")
+    report.append(f"Source file: {source_file_name}")
+    report.append(f"Total rows in source: {n_rows_raw}")
+    report.append(f"Rows used for ANOVA/Pearson: {n_rows_anova}")
+    report.append(f"Rows used for ML (after NA drop): {n_rows_ml}")
+    if n_rows_dropped > 0:
+        report.append(f"Rows dropped for ML due to missing values: {n_rows_dropped}")
     if factor_type_log:
         report.append("Factor type handling:")
         for f, status in factor_type_log.items():
@@ -1673,7 +1681,12 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                 beta, beta_ci_lower, beta_ci_upper,
                                 pca, pca_var_explained, df_pca_summary, df_pca_loadings,
                                 resid_corr, pca_loadings, cv_folds,
-                                factor_type_log=factor_type_log       # ← add this
+                                factor_type_log=factor_type_log,
+                                source_file_name=uploaded_file.name,
+                                n_rows_raw=len(df),
+                                n_rows_anova=len(df.dropna(subset=RESPONSE_COLS)),
+                                n_rows_ml=len(df_ml),
+                                n_rows_dropped=len(df) - len(df_ml)
                             )
                             
                             zip_buffer = io.BytesIO()
