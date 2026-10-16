@@ -7,3 +7,5 @@ __pycache__/
 .Rhistory
 .RData
 .ipynb_checkpoints/
+simulation/results/scenarios_v1/
+simulation/results/verification/
