@@ -40,6 +40,32 @@ import os
 # standardization to ensure eigenvalues sum to p and that
 # variance estimates are consistent across the pipeline.
 # ─────────────────────────────────────────────────────────────
+def benjamini_hochberg(pvals):
+    """
+    Benjamini-Hochberg FDR correction.
+    Returns q-values in the same order as input p-values.
+    NaN values are preserved and excluded from the correction.
+    """
+    p = np.asarray(pvals, dtype=float)
+    q = np.full_like(p, np.nan)
+    mask = ~np.isnan(p)
+    if mask.sum() == 0:
+        return q
+    p_valid = p[mask]
+    n = len(p_valid)
+    order = np.argsort(p_valid)
+    ranked = p_valid[order]
+    # q_i = min over j>=i of (n/j * p_j)
+    adjusted = ranked * n / np.arange(1, n + 1)
+    # Enforce monotonicity from the largest p downward
+    adjusted = np.minimum.accumulate(adjusted[::-1])[::-1]
+    adjusted = np.clip(adjusted, 0.0, 1.0)
+    # Restore original order
+    q_valid = np.empty(n)
+    q_valid[order] = adjusted
+    q[mask] = q_valid
+    return q
+
 def standardize_ddof1(A):
     """Column-wise Z-score with sample SD (ddof=1)."""
     A = np.asarray(A, dtype=float)
@@ -79,7 +105,8 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
                          resid_corr, pca_loadings, cv_folds,
                          factor_type_log=None,
                          source_file_name=None, n_rows_raw=None,
-                         n_rows_anova=None, n_rows_ml=None, n_rows_dropped=None):      # ← add this
+                         n_rows_anova=None, n_rows_ml=None, n_rows_dropped=None,
+                         df_anova_fdr=None):
     """Generate a comprehensive text report of all analyses."""
     
     report = []
@@ -194,7 +221,9 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
     for resp in RESPONSE_COLS:
         if resp in full_anova_tables:
             report.append(f"\n--- {resp} ---")
-            report.append(full_anova_tables[resp].round(4).to_string())
+            cols_show = [c for c in ['sum_sq','df','F','PR(>F)','η²','q_within']
+                         if c in full_anova_tables[resp].columns]
+            report.append(full_anova_tables[resp][cols_show].round(6).to_string())
             
             atbl = full_anova_tables[resp]
             sig_effects = atbl[atbl['PR(>F)'] < 0.05]
@@ -206,6 +235,22 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
                         effect_size = "large" if eta >= 0.14 else "medium" if eta >= 0.06 else "small"
                         report.append(f"    • {idx}: F={atbl.loc[idx,'F']:.2f}, p={atbl.loc[idx,'PR(>F)']:.4f}, "
                                      f"η²={eta:.4f} ({effect_size} effect)")
+
+    # ---- FDR summary ----
+    if df_anova_fdr is not None and len(df_anova_fdr) > 0:
+        report.append("\n\n" + "=" * 80)
+        report.append("4b. ANOVA WITH FDR CORRECTION (Benjamini-Hochberg)")
+        report.append("=" * 80)
+        report.append("\nq_within = BH correction across terms within a response")
+        report.append("q_across = BH correction across responses for the same term\n")
+        cols_fdr = ['Response','Term','F','p_raw','q_within','q_across','η²']
+        report.append(df_anova_fdr[cols_fdr].round(6).to_string(index=False))
+        
+        surviving = df_anova_fdr[(df_anova_fdr['q_within'] < 0.05) | 
+                                 (df_anova_fdr['q_across'] < 0.05)]
+        report.append(f"\nEffects surviving FDR (q < 0.05, either correction): "
+                      f"{len(surviving)} of {len(df_anova_fdr)}")
+    
     
     if len(df_int) > 0:
         sig_int_df = df_int[df_int['Sig.'] != 'ns']
@@ -726,8 +771,6 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                 normality = "Normal" if p_shapiro >= 0.05 else "Non-normal"
                             except:
                                 stat_shapiro, p_shapiro, normality = np.nan, np.nan, "Error"
-                            # TEMPORARY DEBUG
-                            #st.write(f"DEBUG: resp={resp}, n_factors={n_factors}, FACTOR_COLS={FACTOR_COLS}")
                            
                             try:
                                 if n_factors >= 2:
@@ -847,6 +890,9 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                     if idx_row != 'Residual':
                                         eta_sq[idx_row] = atbl.loc[idx_row,'sum_sq']/(atbl.loc[idx_row,'sum_sq']+ss_error)
                                 atbl['η²'] = [eta_sq.get(idx,np.nan) for idx in atbl.index]
+                                # BH FDR correction within this response
+                                pvals = atbl['PR(>F)'].values.astype(float).copy()
+                                atbl['q_within'] = benjamini_hochberg(pvals)
                                 full_anova_tables[resp] = atbl
                                 if n_factors >= 2:
                                     for f1,f2 in combinations(FACTOR_COLS,2):
@@ -860,9 +906,33 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                                           'F_int':fi,'p_int':pi,'Sig.':sig,'Type':itype})
                             except Exception as ex:
                                 st.warning(f"ANOVA failed for {resp}: {str(ex)[:80]}")
-                        df_int = pd.DataFrame(all_int) if all_int else pd.DataFrame()
-                        sig_int = df_int[df_int['Sig.']!='ns'] if len(df_int)>0 else df_int
+                        # ---- Cross-response FDR ----
+                        # For each ANOVA term, correct p-values across responses.
+                        anova_fdr_records = []
+                        for resp, atbl in full_anova_tables.items():
+                            for term in atbl.index:
+                                if term == 'Residual':
+                                    continue
+                                anova_fdr_records.append({
+                                    'Response': resp,
+                                    'Term': term,
+                                    'F': atbl.loc[term, 'F'],
+                                    'p_raw': atbl.loc[term, 'PR(>F)'],
+                                    'q_within': atbl.loc[term, 'q_within'],
+                                    'η²': atbl.loc[term, 'η²'],
+                                })
+                        df_anova_fdr = pd.DataFrame(anova_fdr_records)
                         
+                        # Cross-response correction: group by Term, apply BH
+                        if len(df_anova_fdr) > 0:
+                            q_across = np.full(len(df_anova_fdr), np.nan)
+                            for term, idx in df_anova_fdr.groupby('Term').groups.items():
+                                sub_p = df_anova_fdr.loc[idx, 'p_raw'].values.astype(float)
+                                sub_q = benjamini_hochberg(sub_p)
+                                q_across[df_anova_fdr.index.get_indexer(idx)] = sub_q
+                            df_anova_fdr['q_across'] = q_across
+
+                                                
                         # Kruskal-Wallis
                         kw_validation = []
                         for resp in RESPONSE_COLS:
@@ -1686,7 +1756,8 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                 n_rows_raw=len(df),
                                 n_rows_anova=len(df.dropna(subset=RESPONSE_COLS)),
                                 n_rows_ml=len(df_ml),
-                                n_rows_dropped=len(df) - len(df_ml)
+                                n_rows_dropped=len(df) - len(df_ml),
+                                df_anova_fdr=df_anova_fdr
                             )
                             
                             zip_buffer = io.BytesIO()
