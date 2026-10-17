@@ -92,6 +92,7 @@ def nadeau_bengio_ttest(a, b, K):
     var_d = d.var(ddof=1)
     if var_d <= 0:
         return np.nan, np.nan
+
     # Nadeau-Bengio: inflate variance by (1/K + n_test/n_train)
     n_test = n
     n_train = max(n * (K - 1), 1)
@@ -100,6 +101,96 @@ def nadeau_bengio_ttest(a, b, K):
     df = n - 1
     p_value = 2.0 * (1.0 - t_dist.cdf(abs(t_stat), df))
     return float(t_stat), float(p_value)
+
+def art_anova(df, response, factors, is_cat_col=True):
+    """
+    Aligned Rank Transform (ART) ANOVA.
+    
+    For each effect (main + interactions), align the response by removing
+    the effect, rank the aligned residuals, and run parametric ANOVA on
+    the ranks.
+    
+    Parameters
+    ----------
+    df : DataFrame     Must contain `response` and factor columns.
+    response : str     Name of the response column.
+    factors : list     List of factor column names (categorical, _cat suffix).
+    is_cat_col : bool  If True, factor names refer to _cat columns.
+    
+    Returns
+    -------
+    dict: {term_name: {'F': float, 'p': float}}
+    """
+    from itertools import combinations
+    from scipy.stats import rankdata
+    
+    sub = df[[response] + factors].dropna(subset=[response]).copy()
+    
+    # Build all terms: main + two-way interactions
+    terms = list(factors)
+    for f1, f2 in combinations(factors, 2):
+        terms.append(f'{f1}:{f2}')
+    
+    results = {}
+    
+    for term in terms:
+        try:
+            # Build formula WITHOUT this term
+            other_terms = [t for t in terms if t != term]
+            if other_terms:
+                formula_reduced = f'Q("{response}") ~ ' + ' + '.join(
+                    [f'C({t})' if ':' not in t else f'C({t.split(":")[0]}):C({t.split(":")[1]})'
+                     for t in other_terms])
+                model_reduced = ols(formula_reduced, data=sub).fit()
+                # Aligned response = original - effect_not_in_reduced_model
+                # (i.e., only this term remains in the alignment)
+                aligned = model_reduced.resid.values
+            else:
+                aligned = sub[response].values
+            
+            # Rank the aligned values
+            ranks = rankdata(aligned)
+            sub['_art_rank'] = ranks
+            
+            # Fit the term on the ranks
+            if ':' in term:
+                f1, f2 = term.split(':')
+                formula_full = f'Q("_art_rank") ~ C({f1}) + C({f2}) + C({f1}):C({f2})'
+            else:
+                other_mains = [f for f in factors if f != term]
+                if other_mains:
+                    formula_full = f'Q("_art_rank") ~ ' + ' + '.join(
+                        [f'C({f})' for f in [term] + other_mains])
+                else:
+                    formula_full = f'Q("_art_rank") ~ C({term})'
+            
+            model_full = ols(formula_full, data=sub).fit()
+            aov = sm.stats.anova_lm(model_full, typ=2)
+            
+            # Extract the F-statistic and p-value for this term
+            target_key = None
+            for idx in aov.index:
+                if idx == 'Residual':
+                    continue
+                if term in idx or all(f in idx for f in term.split(':')):
+                    target_key = idx
+                    break
+            
+            if target_key is not None:
+                results[term] = {
+                    'F': float(aov.loc[target_key, 'F']),
+                    'p': float(aov.loc[target_key, 'PR(>F)']),
+                }
+            else:
+                results[term] = {'F': np.nan, 'p': np.nan}
+        except Exception:
+            results[term] = {'F': np.nan, 'p': np.nan}
+        
+        # Clean up
+        if '_art_rank' in sub.columns:
+            sub.drop(columns=['_art_rank'], inplace=True)
+    
+    return results
 
 def standardize_ddof1(A):
     """Column-wise Z-score with sample SD (ddof=1)."""
@@ -141,7 +232,7 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
                          factor_type_log=None,
                          source_file_name=None, n_rows_raw=None,
                          n_rows_anova=None, n_rows_ml=None, n_rows_dropped=None,
-                         df_anova_fdr=None):
+                         df_anova_fdr=None, df_art=None):
     """Generate a comprehensive text report of all analyses."""
     
     report = []
@@ -296,6 +387,13 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
     if len(df_kw) > 0:
         report.append(f"\n\nKruskal-Wallis Non-Parametric Validation:")
         report.append(df_kw.to_string(index=False))
+    if df_art is not None and len(df_art) > 0:
+        report.append("\n\nART ANOVA (aligned rank transform) — Item 1g")
+        report.append(df_art.round(4).to_string(index=False))
+        report.append("\n  Note: ART ANOVA is the design-appropriate non-parametric")
+        report.append("  validation for factorial designs; it accounts for all factor")
+        report.append("  effects and interactions, unlike Kruskal-Wallis applied")
+        report.append("  factor-by-factor.")
     
     # ── 5. POST-HOC MEAN COMPARISONS ──
     report.append("\n\n" + "=" * 80)
@@ -1102,6 +1200,30 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                                         'Agreement':agreement})
                                 except: pass
                         df_kw = pd.DataFrame(kw_validation)
+
+                        # ---- ART ANOVA (Item 1g) ----
+                        art_rows = []
+                        art_cat_cols = [f'{f}_cat' for f in FACTOR_COLS]
+                        for resp in RESPONSE_COLS:
+                            try:
+                                art_res = art_anova(df, resp, art_cat_cols)
+                                # For each main effect + interaction, add a row
+                                for term, stats_ in art_res.items():
+                                    # Extract factor names from term for display
+                                    if ':' in term:
+                                        f1, f2 = term.split(':')
+                                        factor_display = f"{f1.replace('_cat','')} × {f2.replace('_cat','')}"
+                                    else:
+                                        factor_display = term.replace('_cat','')
+                                    art_rows.append({
+                                        'Response': resp,
+                                        'Effect': factor_display,
+                                        'ART_F': stats_['F'],
+                                        'ART_p': stats_['p'],
+                                    })
+                            except Exception as ex:
+                                st.warning(f"ART ANOVA failed for {resp}: {str(ex)[:80]}")
+                        df_art = pd.DataFrame(art_rows) if art_rows else pd.DataFrame()
                         
                         progress_bar.progress(15, text="Running SHAP analysis...")
                         
@@ -1900,6 +2022,12 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                     with st.expander(f"ANOVA: {resp}"):
                                         st.dataframe(full_anova_tables[resp].round(4), use_container_width=True)
                             st.markdown("---")
+                            st.subheader("ART ANOVA (aligned rank transform)")
+                            if len(df_art) > 0:
+                                st.dataframe(df_art.round(4), use_container_width=True)
+                            else:
+                                st.info("ART ANOVA not available.")
+                            st.markdown("---")
                             st.subheader("Kruskal-Wallis Validation")
                             if len(df_kw)>0: st.dataframe(df_kw, use_container_width=True)
                             else: st.info("Not available.")
@@ -1999,7 +2127,8 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                 n_rows_anova=len(df.dropna(subset=RESPONSE_COLS)),
                                 n_rows_ml=len(df_ml),
                                 n_rows_dropped=len(df) - len(df_ml),
-                                df_anova_fdr=df_anova_fdr
+                                df_anova_fdr=df_anova_fdr,
+                                df_art=df_art
                             )
                             
                             zip_buffer = io.BytesIO()
