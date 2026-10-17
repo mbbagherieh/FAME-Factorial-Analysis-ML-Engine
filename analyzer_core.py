@@ -22,7 +22,7 @@ from sklearn.multioutput import MultiOutputRegressor
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
 from sklearn.inspection import permutation_importance
-from sklearn.model_selection import cross_val_score, KFold
+from sklearn.model_selection import cross_val_score, KFold, GroupKFold
 from sklearn.decomposition import PCA
 import shap
 from itertools import combinations
@@ -318,25 +318,82 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
     report.append("\n\n" + "=" * 80)
     report.append(f"8. MODEL PERFORMANCE COMPARISON ({cv_folds}-Fold CV R²)")
     report.append("=" * 80)
-    report.append("\nTable: Cross-validated R² (mean ± std)")
+    report.append("\nTable: Cross-validated R² (mean ± std) — standard KFold")
     perf_cols = ['Response', 'RF_R2_mean', 'RF_R2_std', 'LR_R2_mean', 'LR_R2_std', 
-                'GPR_R2_mean', 'GPR_R2_std', 'Best']
+                'GPR_R2_mean', 'GPR_R2_std']
     report.append(df_mc[perf_cols].round(3).to_string(index=False))
     
-    report.append("\n\nTable: Pairwise Model Comparisons (Paired t-test on CV folds)")
+    # ---- GroupKFold comparison (Item 1d) ----
+    if 'RF_R2_group' in df_mc.columns and df_mc['RF_R2_group'].notna().any():
+        report.append("\n\n" + "-" * 80)
+        report.append("Table: Cross-validated R² — GroupKFold by treatment combination")
+        report.append("(Prevents leakage when replicate samples share a treatment cell)")
+        report.append("-" * 80)
+        group_cols = ['Response', 'RF_R2_group', 'LR_R2_group', 'GPR_R2_group']
+        report.append(df_mc[group_cols].round(3).to_string(index=False))
+        
+        # Change in performance between the two splitters
+        report.append("\n\nΔR² (GroupKFold − KFold):")
+        for _, row in df_mc.iterrows():
+            if not np.isnan(row.get('RF_R2_group', np.nan)):
+                d_rf  = row['RF_R2_group']  - row['RF_R2_mean']
+                d_lr  = row['LR_R2_group']  - row['LR_R2_mean']
+                d_gpr = row['GPR_R2_group'] - row['GPR_R2_mean']
+                report.append(f"  {row['Response']:<15}  "
+                              f"RF: {d_rf:+.3f}   "
+                              f"LR: {d_lr:+.3f}   "
+                              f"GPR: {d_gpr:+.3f}")
+        
+        # Summary interpretation
+        mean_d_rf = (df_mc['RF_R2_group'] - df_mc['RF_R2_mean']).mean()
+        report.append(f"\nMean ΔR² across responses — RF: {mean_d_rf:+.3f}")
+        if mean_d_rf < -0.05:
+            report.append("→ Performance drop under GroupKFold indicates that the "
+                          "standard KFold estimates were optimistically biased by "
+                          "shared replicate cells between train and test folds.")
+        elif mean_d_rf > 0.05:
+            report.append("→ Performance increase under GroupKFold suggests the "
+                          "standard splitter was not the limiting factor; "
+                          "results are conservative.")
+        else:
+            report.append("→ Performance is stable across splitters, indicating "
+                          "standard KFold results were not materially inflated.")
+    
+    report.append("\n\nTable: Pairwise Model Comparisons — standard KFold (Paired t-test on CV folds)")
     if 'RF_vs_LR' in df_mc.columns:
         test_cols = ['Response', 'RF_vs_LR', 'RF_vs_GPR', 'LR_vs_GPR']
         report.append(df_mc[test_cols].to_string(index=False))
         report.append("\n  * p < 0.05, ** p < 0.01, *** p < 0.001, ns = not significant")
     else:
         report.append("  Not available.")
+        
+    if 'RF_vs_LR_group' in df_mc.columns and df_mc['RF_vs_LR_group'].notna().any():
+        report.append("\n\nTable: Pairwise Model Comparisons — GroupKFold (Paired t-test on CV folds)")
+        test_cols_g = ['Response', 'RF_vs_LR_group', 'RF_vs_GPR_group', 'LR_vs_GPR_group']
+        report.append(df_mc[test_cols_g].to_string(index=False))
+        report.append("\n  * p < 0.05, ** p < 0.01, *** p < 0.001, ns = not significant")
     
     report.append("\nInterpretation:")
     for _, row in df_mc.iterrows():
-        report.append(f"  • {row['Response']}: Best model = {row['Best']} "
-                     f"(RF={row['RF_R2_mean']:.3f}, LR={row['LR_R2_mean']:.3f}, GPR={row['GPR_R2_mean']:.3f})")
+        report.append(f"  • {row['Response']}")
+        
+        # KFold interpretation
+        best_k = 'RF' if row['RF_R2_mean']>=max(row['LR_R2_mean'],row['GPR_R2_mean']) else \
+                 'LR' if row['LR_R2_mean']>=max(row['RF_R2_mean'],row['GPR_R2_mean']) else 'GPR'
+        report.append(f"      KFold:      Best = {best_k}  "
+                      f"(RF={row['RF_R2_mean']:.3f}, LR={row['LR_R2_mean']:.3f}, GPR={row['GPR_R2_mean']:.3f})")
         if 'RF_vs_LR' in row:
-            report.append(f"      {row['RF_vs_LR']}  |  {row['RF_vs_GPR']}  |  {row['LR_vs_GPR']}")    
+            report.append(f"                  {row['RF_vs_LR']}  |  {row['RF_vs_GPR']}  |  {row['LR_vs_GPR']}")
+            
+        # GroupKFold interpretation
+        if 'RF_R2_group' in row and not pd.isna(row['RF_R2_group']):
+            best_g = 'RF' if row['RF_R2_group']>=max(row['LR_R2_group'],row['GPR_R2_group']) else \
+                     'LR' if row['LR_R2_group']>=max(row['RF_R2_group'],row['GPR_R2_group']) else 'GPR'
+            report.append(f"      GroupKFold: Best = {best_g}  "
+                          f"(RF={row['RF_R2_group']:.3f}, LR={row['LR_R2_group']:.3f}, GPR={row['GPR_R2_group']:.3f})")
+            if 'RF_vs_LR_group' in row:
+                report.append(f"                  {row['RF_vs_LR_group']}  |  {row['RF_vs_GPR_group']}  |  {row['LR_vs_GPR_group']}")
+    
     # ── 9. STANDARDIZED BETA COEFFICIENTS ──
     report.append("\n\n" + "=" * 80)
     report.append("9. STANDARDIZED REGRESSION COEFFICIENTS (β) with 95% Bootstrap CI")
@@ -906,6 +963,10 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                                           'F_int':fi,'p_int':pi,'Sig.':sig,'Type':itype})
                             except Exception as ex:
                                 st.warning(f"ANOVA failed for {resp}: {str(ex)[:80]}")
+                        df_int = pd.DataFrame(all_int) if all_int else pd.DataFrame()
+                        sig_int = df_int[df_int['Sig.']!='ns'] if len(df_int)>0 else df_int
+                        
+                        # ---- Cross-response FDR ----
                         # ---- Cross-response FDR ----
                         # For each ANOVA term, correct p-values across responses.
                         anova_fdr_records = []
@@ -998,13 +1059,40 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                         
                         # ---- CV ----
                         cv = KFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
+                        
+                        # ---- GroupKFold by treatment combination (Item 1d) ----
+                        # Prevents leakage when replicate samples share a treatment cell.
+                        # Encode each unique treatment combination as an integer group ID.
+                        # Factor values are already numeric (continuous) or label-encoded
+                        # (categorical) at this point, so tuple-as-key works, then we map
+                        # each unique tuple to a small integer.
+                        _group_tuples = [
+                            tuple(row) for row in df_ml_encoded[FACTOR_COLS].values
+                        ]
+                        _unique_groups = {t: i for i, t in enumerate(set(_group_tuples))}
+                        treatment_groups = np.array(
+                            [_unique_groups[t] for t in _group_tuples],
+                            dtype=int
+                        )
+                        n_groups = len(_unique_groups)
+                   
+                        if n_groups >= cv_folds:
+                            cv_group = GroupKFold(n_splits=cv_folds)
+                        elif n_groups >= 2:
+                            cv_group = GroupKFold(n_splits=n_groups)
+                            st.info(f"GroupKFold reduced to {n_groups} folds "
+                                    f"(number of treatment combinations).")
+                        else:
+                            cv_group = None
+                            st.warning("Too few treatment groups for GroupKFold; "
+                                       "only standard KFold will be shown.")
+                        
                         model_comparison = []
                         for idx, resp in enumerate(RESPONSE_COLS):
                             try:
                                 rf = RandomForestRegressor(n_estimators=rf_estimators, max_depth=None,
                                                            min_samples_leaf=2, random_state=random_state, n_jobs=-1)
-                                rf_cv = cross_val_score(rf, X_ml, Y_ml[:,idx], cv=cv, scoring='r2')
-                                lr_cv = cross_val_score(LinearRegression(), X_ml, Y_ml[:,idx], cv=cv, scoring='r2')
+                                lr = LinearRegression()
                                 from sklearn.pipeline import make_pipeline
                                 gpr = make_pipeline(
                                     StandardScaler(),
@@ -1014,13 +1102,29 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                         n_restarts_optimizer=10,
                                         random_state=random_state)
                                 )
-                                gpr_cv = cross_val_score(gpr, X_ml, Y_ml[:,idx], cv=cv, scoring='r2')
                                 
-                                # Determine best model by mean R²
+                                # Standard KFold (original)
+                                rf_cv   = cross_val_score(rf,  X_ml, Y_ml[:,idx], cv=cv,       scoring='r2')
+                                lr_cv   = cross_val_score(lr,  X_ml, Y_ml[:,idx], cv=cv,       scoring='r2')
+                                gpr_cv  = cross_val_score(gpr, X_ml, Y_ml[:,idx], cv=cv,       scoring='r2')
+                                
+                                # GroupKFold (Item 1d) — no leakage across replicate cells
+                                if cv_group is not None:
+                                    rf_cv_g  = cross_val_score(rf,  X_ml, Y_ml[:,idx],
+                                                               cv=cv_group, groups=treatment_groups,
+                                                               scoring='r2')
+                                    lr_cv_g  = cross_val_score(lr,  X_ml, Y_ml[:,idx],
+                                                               cv=cv_group, groups=treatment_groups,
+                                                               scoring='r2')
+                                    gpr_cv_g = cross_val_score(gpr, X_ml, Y_ml[:,idx],
+                                                               cv=cv_group, groups=treatment_groups,
+                                                               scoring='r2')
+                                else:
+                                    rf_cv_g = lr_cv_g = gpr_cv_g = None
+                                
                                 best = 'RF' if rf_cv.mean()>=max(lr_cv.mean(),gpr_cv.mean()) else \
                                        'LR' if lr_cv.mean()>=max(rf_cv.mean(),gpr_cv.mean()) else 'GPR'
                                 
-                                # Paired t-tests on fold scores
                                 def format_ttest(a, b, name_a, name_b):
                                     """Perform paired t-test and return formatted string."""
                                     try:
@@ -1040,19 +1144,35 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                     except:
                                         return 'N/A'
                                 
-                                test_rf_lr = format_ttest(rf_cv, lr_cv, 'RF', 'LR')
-                                test_rf_gpr = format_ttest(rf_cv, gpr_cv, 'RF', 'GPR')
-                                test_lr_gpr = format_ttest(lr_cv, gpr_cv, 'LR', 'GPR')
+                                test_rf_lr  = format_ttest(rf_cv,  lr_cv,  'RF', 'LR')
+                                test_rf_gpr = format_ttest(rf_cv,  gpr_cv, 'RF', 'GPR')
+                                test_lr_gpr = format_ttest(lr_cv,  gpr_cv, 'LR', 'GPR')
                                 
+                                # GroupKFold t-tests (Item 1d)
+                                if rf_cv_g is not None:
+                                    test_rf_lr_g  = format_ttest(rf_cv_g,  lr_cv_g,  'RF', 'LR')
+                                    test_rf_gpr_g = format_ttest(rf_cv_g,  gpr_cv_g, 'RF', 'GPR')
+                                    test_lr_gpr_g = format_ttest(lr_cv_g,  gpr_cv_g, 'LR', 'GPR')
+                                else:
+                                    test_rf_lr_g = test_rf_gpr_g = test_lr_gpr_g = 'N/A'
+                               
                                 model_comparison.append({
                                     'Response': resp,
-                                    'RF_R2_mean': rf_cv.mean(), 'RF_R2_std': rf_cv.std(),
-                                    'LR_R2_mean': lr_cv.mean(), 'LR_R2_std': lr_cv.std(),
+                                    'RF_R2_mean': rf_cv.mean(),  'RF_R2_std': rf_cv.std(),
+                                    'LR_R2_mean': lr_cv.mean(),  'LR_R2_std': lr_cv.std(),
                                     'GPR_R2_mean': gpr_cv.mean(), 'GPR_R2_std': gpr_cv.std(),
                                     'Best': best,
                                     'RF_vs_LR': test_rf_lr,
                                     'RF_vs_GPR': test_rf_gpr,
-                                    'LR_vs_GPR': test_lr_gpr
+                                    'LR_vs_GPR': test_lr_gpr,
+                                    # GroupKFold results (Item 1d)
+                                    'RF_R2_group':  rf_cv_g.mean()  if rf_cv_g  is not None else np.nan,
+                                    'LR_R2_group':  lr_cv_g.mean()  if lr_cv_g  is not None else np.nan,
+                                    'GPR_R2_group': gpr_cv_g.mean() if gpr_cv_g is not None else np.nan,
+                                    # GroupKFold t-tests (Item 1d)
+                                    'RF_vs_LR_group':  test_rf_lr_g,
+                                    'RF_vs_GPR_group': test_rf_gpr_g,
+                                    'LR_vs_GPR_group': test_lr_gpr_g,
                                 })
                             except Exception as ex:
                                 st.warning(f"CV failed for {resp}: {str(ex)[:80]}")
@@ -1062,7 +1182,11 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                     'LR_R2_mean': np.nan, 'LR_R2_std': np.nan,
                                     'GPR_R2_mean': np.nan, 'GPR_R2_std': np.nan,
                                     'Best': 'Error',
-                                    'RF_vs_LR': 'N/A', 'RF_vs_GPR': 'N/A', 'LR_vs_GPR': 'N/A'
+                                    'RF_vs_LR': 'N/A', 'RF_vs_GPR': 'N/A', 'LR_vs_GPR': 'N/A',
+                                    'RF_R2_group': np.nan, 'LR_R2_group': np.nan,
+                                    'GPR_R2_group': np.nan,
+                                    'RF_vs_LR_group': 'N/A', 'RF_vs_GPR_group': 'N/A', 
+                                    'LR_vs_GPR_group': 'N/A',
                                 })
                         df_mc = pd.DataFrame(model_comparison)
                         
@@ -1698,14 +1822,17 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                                        columns=FACTOR_COLS, index=RESPONSE_COLS).round(1)
                             st.dataframe(shap_pct_df, use_container_width=True)
                             st.subheader(f"Model Comparison ({cv_folds}-Fold CV R²)")
+
                             # Display performance metrics
                             perf_cols = ['Response', 'RF_R2_mean', 'RF_R2_std', 'LR_R2_mean', 'LR_R2_std', 
-                                        'GPR_R2_mean', 'GPR_R2_std', 'Best']
+                                        'GPR_R2_mean', 'GPR_R2_std',
+                                        'RF_R2_group', 'LR_R2_group', 'GPR_R2_group']
                             st.dataframe(df_mc[perf_cols].round(3), use_container_width=True)
                             
                             # Display pairwise statistical tests
                             st.markdown("**Pairwise Model Comparisons (Paired t-test on CV folds)**")
-                            test_cols = ['Response', 'RF_vs_LR', 'RF_vs_GPR', 'LR_vs_GPR']
+                            test_cols = ['Response', 'RF_vs_LR', 'RF_vs_GPR', 'LR_vs_GPR',
+                                         'RF_vs_LR_group', 'RF_vs_GPR_group', 'LR_vs_GPR_group']
                             st.dataframe(df_mc[test_cols], use_container_width=True)
                             st.caption("* p < 0.05, ** p < 0.01, *** p < 0.001, ns = not significant")
                             st.subheader("Standardized Regression Coefficients (β)")
