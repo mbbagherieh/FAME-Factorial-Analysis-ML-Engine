@@ -102,6 +102,50 @@ def nadeau_bengio_ttest(a, b, K):
     p_value = 2.0 * (1.0 - t_dist.cdf(abs(t_stat), df))
     return float(t_stat), float(p_value)
 
+def simple_effects(df, response, factor_fixed, factor_contrast):
+    """
+    Test the effect of `factor_fixed` at each level of `factor_contrast`.
+    
+    For each level of the contrast factor, subset the data and run a
+    one-way ANOVA of the fixed factor. Reports F and p for the fixed
+    factor at each level, revealing how its effect changes across the
+    levels of the other factor.
+    
+    Parameters
+    ----------
+    df : DataFrame
+    response : str
+    factor_fixed : str      Factor whose effect is tested
+    factor_contrast : str   Factor whose levels define the subsets
+    
+    Returns
+    -------
+    dict: {contrast_level: {'F': float, 'p': float, 'df': int}}
+    """
+    results = {}
+    if factor_fixed not in df.columns or factor_contrast not in df.columns:
+        return results
+    
+    for level in sorted(df[factor_contrast].dropna().unique()):
+        subset = df[df[factor_contrast] == level].dropna(subset=[response])
+        if len(subset) < 4:
+            results[str(level)] = {'F': np.nan, 'p': np.nan, 'df': 0}
+            continue
+        try:
+            formula = f'Q("{response}") ~ C({factor_fixed})'
+            model = ols(formula, data=subset).fit()
+            aov = sm.stats.anova_lm(model, typ=2)  # one-way; typ irrelevant here
+            key = [idx for idx in aov.index if idx != 'Residual'][0]
+            results[str(level)] = {
+                'F': float(aov.loc[key, 'F']),
+                'p': float(aov.loc[key, 'PR(>F)']),
+                'df': int(aov.loc[key, 'df']),
+            }
+        except Exception:
+            results[str(level)] = {'F': np.nan, 'p': np.nan, 'df': 0}
+    
+    return results
+
 def art_anova(df, response, factors, is_cat_col=True):
     """
     Aligned Rank Transform (ART) ANOVA.
@@ -232,7 +276,7 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
                          factor_type_log=None,
                          source_file_name=None, n_rows_raw=None,
                          n_rows_anova=None, n_rows_ml=None, n_rows_dropped=None,
-                         df_anova_fdr=None, df_art=None):
+                         df_anova_fdr=None, df_art=None, df_simple=None):
     """Generate a comprehensive text report of all analyses."""
     
     report = []
@@ -352,7 +396,7 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
             report.append(full_anova_tables[resp][cols_show].round(6).to_string())
             
             atbl = full_anova_tables[resp]
-            sig_effects = atbl[atbl['PR(>F)'] < 0.05]
+            sig_effects = atbl[(atbl['PR(>F)'] < 0.05) & (atbl.index != 'Intercept')]            
             if len(sig_effects) > 0:
                 report.append(f"\n  Significant effects (p < 0.05):")
                 for idx in sig_effects.index:
@@ -383,7 +427,29 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
         if len(sig_int_df) > 0:
             report.append(f"\nSignificant Two-Way Interactions (p < 0.05):")
             report.append(sig_int_df[['Response','Factor_1','Factor_2','F_int','p_int','Sig.','Type']].to_string(index=False))
-    
+    if df_simple is not None and len(df_simple) > 0:
+        report.append("\n\nSIMPLE EFFECTS ANALYSIS")
+        report.append("=" * 80)
+        report.append("For each significant interaction, the effect of each factor")
+        report.append("is tested separately at each level of the other factor.\n")
+        
+        for _, row in df_simple.iterrows():
+            report.append(f"\n--- {row['Response']}  |  {row['Interaction']} ---")
+            
+            for col_name in row.index:
+                if col_name in ('Response', 'Interaction'):
+                    continue
+                report.append(f"\n  {col_name}:")
+                se_dict = row[col_name]
+                if isinstance(se_dict, dict):
+                    for level, stats_ in se_dict.items():
+                        if not np.isnan(stats_.get('F', np.nan)):
+                            p = stats_.get('p', np.nan)
+                            sig = '***' if p < 0.001 else '**' if p < 0.01 else '*' if p < 0.05 else 'ns'
+                            report.append(f"    at {level}: F={stats_['F']:.3f}, p={p:.4f} {sig}")
+                        else:
+                            report.append(f"    at {level}: insufficient data")    
+
     if len(df_kw) > 0:
         report.append(f"\n\nKruskal-Wallis Non-Parametric Validation:")
         report.append(df_kw.to_string(index=False))
@@ -1107,6 +1173,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                         progress_bar.progress(8, text="Running N-way ANOVA...")
                         all_int = []
                         full_anova_tables = {}
+                        simple_effects_records = []
                         for resp in RESPONSE_COLS:
                             main_effects = ' + '.join([f'C({f}_cat)' for f in FACTOR_COLS])
                             if n_factors >= 2:
@@ -1117,13 +1184,16 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                             try:
                                 df_anova = df.dropna(subset=[resp])
                                 model = ols(formula, data=df_anova).fit()
-                                atbl = sm.stats.anova_lm(model, typ=2)
+                                atbl = sm.stats.anova_lm(model, typ=3)
                                 ss_error = atbl.loc['Residual', 'sum_sq']
                                 eta_sq = {}
                                 for idx_row in atbl.index:
                                     if idx_row != 'Residual':
                                         eta_sq[idx_row] = atbl.loc[idx_row,'sum_sq']/(atbl.loc[idx_row,'sum_sq']+ss_error)
                                 atbl['η²'] = [eta_sq.get(idx,np.nan) for idx in atbl.index]
+                                # Remove Intercept row from display (Type III includes it)
+                                if 'Intercept' in atbl.index:
+                                    atbl = atbl.drop('Intercept')
                                 # BH FDR correction within this response
                                 pvals = atbl['PR(>F)'].values.astype(float).copy()
                                 atbl['q_within'] = benjamini_hochberg(pvals)
@@ -1138,10 +1208,26 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                             itype = 'Synergistic' if (pi<0.05 and fi>10) else ('Moderate' if pi<0.05 else 'Additive')
                                             all_int.append({'Response':resp,'Factor_1':f1,'Factor_2':f2,
                                                           'F_int':fi,'p_int':pi,'Sig.':sig,'Type':itype})
+                                            # Simple effects if interaction is significant (Reviewer 3, Suggestion 1)
+                                            if pi < 0.05 and n_factors == 2:
+                                                try:
+                                                    se_f1 = simple_effects(
+                                                        df_anova, resp, f'{f1}_cat', f'{f2}_cat')
+                                                    se_f2 = simple_effects(
+                                                        df_anova, resp, f'{f2}_cat', f'{f1}_cat')
+                                                    simple_effects_records.append({
+                                                        'Response': resp,
+                                                        'Interaction': f'{f1} × {f2}',
+                                                        f'{f1} at levels of {f2}': se_f1,
+                                                        f'{f2} at levels of {f1}': se_f2,
+                                                    })
+                                                except Exception as ex:
+                                                    pass
                             except Exception as ex:
                                 st.warning(f"ANOVA failed for {resp}: {str(ex)[:80]}")
                         df_int = pd.DataFrame(all_int) if all_int else pd.DataFrame()
                         sig_int = df_int[df_int['Sig.']!='ns'] if len(df_int)>0 else df_int
+                        df_simple = pd.DataFrame(simple_effects_records) if simple_effects_records else pd.DataFrame()
                         
                         # ---- Cross-response FDR ----
                         # ---- Cross-response FDR ----
@@ -2128,7 +2214,8 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                 n_rows_ml=len(df_ml),
                                 n_rows_dropped=len(df) - len(df_ml),
                                 df_anova_fdr=df_anova_fdr,
-                                df_art=df_art
+                                df_art=df_art,
+                                df_simple=df_simple
                             )
                             
                             zip_buffer = io.BytesIO()
