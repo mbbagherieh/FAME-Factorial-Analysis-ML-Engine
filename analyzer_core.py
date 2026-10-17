@@ -102,6 +102,63 @@ def nadeau_bengio_ttest(a, b, K):
     p_value = 2.0 * (1.0 - t_dist.cdf(abs(t_stat), df))
     return float(t_stat), float(p_value)
 
+def run_seed_stability(X_ml, Y_ml, factors, n_responses, rf_estimators,
+                        cv_folds, n_seeds=20):
+    """
+    Run SHAP and CV under multiple random seeds to assess stability.
+    
+    Parameters
+    ----------
+    X_ml : array         Feature matrix (n_samples, n_factors)
+    Y_ml : array         Response matrix (n_samples, n_responses)
+    factors : list       Factor names
+    n_responses : int
+    rf_estimators : int
+    cv_folds : int
+    n_seeds : int        Number of random seeds to test
+    
+    Returns
+    -------
+    dict with keys:
+      'shap_mean'  : (n_responses, n_factors) — mean SHAP % across seeds
+      'shap_sd'    : (n_responses, n_factors) — SD of SHAP % across seeds
+      'cv_r2_mean' : (n_responses,) — mean CV R² across seeds
+      'cv_r2_sd'   : (n_responses,) — SD of CV R² across seeds
+      'seeds'      : list of seeds tested
+    """
+    seeds = list(range(1, n_seeds + 1))
+    n_factors = len(factors)
+    
+    shap_all = np.zeros((n_seeds, n_responses, n_factors))
+    cv_r2_all = np.zeros((n_seeds, n_responses))
+    
+    for i, seed in enumerate(seeds):
+        for j in range(n_responses):
+            y = Y_ml[:, j]
+            try:
+                rf = RandomForestRegressor(
+                    n_estimators=rf_estimators, max_depth=None,
+                    min_samples_leaf=2, random_state=seed, n_jobs=-1)
+                rf.fit(X_ml, y)
+                explainer = shap.TreeExplainer(rf)
+                sv = np.abs(explainer.shap_values(X_ml)).mean(axis=0)
+                shap_all[i, j, :] = 100.0 * sv / sv.sum()
+                
+                cv = KFold(n_splits=cv_folds, shuffle=True, random_state=seed)
+                scores = cross_val_score(rf, X_ml, y, cv=cv, scoring='r2')
+                cv_r2_all[i, j] = scores.mean()
+            except Exception:
+                shap_all[i, j, :] = np.nan
+                cv_r2_all[i, j] = np.nan
+    
+    return {
+        'shap_mean': np.nanmean(shap_all, axis=0),
+        'shap_sd': np.nanstd(shap_all, axis=0),
+        'cv_r2_mean': np.nanmean(cv_r2_all, axis=0),
+        'cv_r2_sd': np.nanstd(cv_r2_all, axis=0),
+        'seeds': seeds,
+    }
+
 def simple_effects(df, response, factor_fixed, factor_contrast):
     """
     Test the effect of `factor_fixed` at each level of `factor_contrast`.
@@ -276,7 +333,8 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
                          factor_type_log=None,
                          source_file_name=None, n_rows_raw=None,
                          n_rows_anova=None, n_rows_ml=None, n_rows_dropped=None,
-                         df_anova_fdr=None, df_art=None, df_simple=None):
+                         df_anova_fdr=None, df_art=None, df_simple=None,
+                         stability_results=None):
     """Generate a comprehensive text report of all analyses."""
     
     report = []
@@ -610,6 +668,33 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
                 report.append(f"      GroupKFold (naive): {row['RF_vs_LR_group']}  |  {row['RF_vs_GPR_group']}  |  {row['LR_vs_GPR_group']}")
             if 'RF_vs_LR_group_NB' in row and pd.notna(row['RF_vs_LR_group_NB']):
                 report.append(f"      GroupKFold (NB):    {row['RF_vs_LR_group_NB']}  |  {row['RF_vs_GPR_group_NB']}  |  {row['LR_vs_GPR_group_NB']}")
+
+    # ── 8c. MULTI-SEED STABILITY ──
+    if stability_results is not None:
+        report.append("\n\n" + "=" * 80)
+        report.append("8c. MULTI-SEED STABILITY (20 seeds)")
+        report.append("=" * 80)
+        report.append("\nAssesses variability of SHAP importances and CV R² across 20 random seeds.")
+        report.append("A small SD indicates results are not dependent on the specific seed.\n")
+        
+        # SHAP stability
+        report.append("SHAP importance (%) — mean ± SD across 20 seeds:")
+        header = "Response".ljust(20) + "  " + "  ".join([f"{f:>18}" for f in FACTOR_COLS])
+        report.append(header)
+        report.append("-" * len(header))
+        for j, resp in enumerate(RESPONSE_COLS):
+            mean_row = stability_results['shap_mean'][j, :]
+            sd_row = stability_results['shap_sd'][j, :]
+            cells = [f"{mean_row[i]:.1f} ± {sd_row[i]:.1f}" for i in range(len(FACTOR_COLS))]
+            report.append(resp.ljust(20) + "  " + "  ".join([f"{c:>18}" for c in cells]))
+        
+        # CV R² stability
+        report.append("\n\nCV R² (RF) — mean ± SD across 20 seeds:")
+        report.append(f"{'Response':<20} {'Mean R²':>10} {'SD R²':>10}")
+        report.append("-" * 42)
+        for j, resp in enumerate(RESPONSE_COLS):
+            report.append(f"{resp:<20} {stability_results['cv_r2_mean'][j]:>10.3f} "
+                          f"{stability_results['cv_r2_sd'][j]:>10.3f}")
     
     # ── 9. STANDARDIZED BETA COEFFICIENTS ──
     report.append("\n\n" + "=" * 80)
@@ -1544,6 +1629,18 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                 resid_corr = np.array([[1.0]])
                         except Exception:
                             resid_corr = np.eye(max(n_responses, 1))
+
+                        # ---- Multi-seed stability analysis (Item 1l) ----
+                        progress_bar.progress(55, text="Running multi-seed stability analysis...")
+                        try:
+                            stability_results = run_seed_stability(
+                                X_ml, Y_ml, FACTOR_COLS, n_responses,
+                                rf_estimators=rf_estimators,
+                                cv_folds=cv_folds, n_seeds=20)
+                        except Exception as ex:
+                            st.warning(f"Stability analysis failed: {str(ex)[:100]}")
+                            stability_results = None
+
                         
                         progress_bar.progress(60, text="Running PCA...")
                         
@@ -2215,7 +2312,8 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                 n_rows_dropped=len(df) - len(df_ml),
                                 df_anova_fdr=df_anova_fdr,
                                 df_art=df_art,
-                                df_simple=df_simple
+                                df_simple=df_simple,
+                                stability_results=stability_results
                             )
                             
                             zip_buffer = io.BytesIO()
