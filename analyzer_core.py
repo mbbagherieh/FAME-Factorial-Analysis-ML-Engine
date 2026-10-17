@@ -66,6 +66,41 @@ def benjamini_hochberg(pvals):
     q[mask] = q_valid
     return q
 
+def nadeau_bengio_ttest(a, b, K):
+    """
+    Nadeau-Bengio corrected t-test for comparison of CV fold scores.
+    
+    Parameters
+    ----------
+    a, b : array-like
+        Per-fold scores for two models. Must have length K.
+    K : int
+        Number of cross-validation folds.
+    
+    Returns
+    -------
+    t_stat : float
+    p_value : float
+    """
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    d = a - b
+    n = len(d)
+    if n < 2:
+        return np.nan, np.nan
+    mean_d = d.mean()
+    var_d = d.var(ddof=1)
+    if var_d <= 0:
+        return np.nan, np.nan
+    # Nadeau-Bengio: inflate variance by (1/K + n_test/n_train)
+    n_test = n
+    n_train = max(n * (K - 1), 1)
+    correction = 1.0 / n + n_test / n_train
+    t_stat = mean_d / np.sqrt(correction * var_d)
+    df = n - 1
+    p_value = 2.0 * (1.0 - t_dist.cdf(abs(t_stat), df))
+    return float(t_stat), float(p_value)
+
 def standardize_ddof1(A):
     """Column-wise Z-score with sample SD (ddof=1)."""
     A = np.asarray(A, dtype=float)
@@ -366,11 +401,25 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
         report.append("\n  * p < 0.05, ** p < 0.01, *** p < 0.001, ns = not significant")
     else:
         report.append("  Not available.")
+
+    if 'RF_vs_LR_NB' in df_mc.columns:
+        report.append("\n\nTable: Pairwise Model Comparisons — standard KFold, "
+                      "Nadeau-Bengio corrected (Item 1e)")
+        nb_cols_std = ['Response', 'RF_vs_LR_NB', 'RF_vs_GPR_NB', 'LR_vs_GPR_NB']
+        report.append(df_mc[nb_cols_std].to_string(index=False))
+        report.append("\n  * p < 0.05, ** p < 0.01, *** p < 0.001, ns = not significant")
         
     if 'RF_vs_LR_group' in df_mc.columns and df_mc['RF_vs_LR_group'].notna().any():
         report.append("\n\nTable: Pairwise Model Comparisons — GroupKFold (Paired t-test on CV folds)")
         test_cols_g = ['Response', 'RF_vs_LR_group', 'RF_vs_GPR_group', 'LR_vs_GPR_group']
         report.append(df_mc[test_cols_g].to_string(index=False))
+        report.append("\n  * p < 0.05, ** p < 0.01, *** p < 0.001, ns = not significant")
+
+    if 'RF_vs_LR_group_NB' in df_mc.columns and df_mc['RF_vs_LR_group_NB'].notna().any():
+        report.append("\n\nTable: Pairwise Model Comparisons — GroupKFold, "
+                      "Nadeau-Bengio corrected (Item 1e)")
+        nb_cols_g = ['Response', 'RF_vs_LR_group_NB', 'RF_vs_GPR_group_NB', 'LR_vs_GPR_group_NB']
+        report.append(df_mc[nb_cols_g].to_string(index=False))
         report.append("\n  * p < 0.05, ** p < 0.01, *** p < 0.001, ns = not significant")
     
     report.append("\nInterpretation:")
@@ -383,7 +432,9 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
         report.append(f"      KFold:      Best = {best_k}  "
                       f"(RF={row['RF_R2_mean']:.3f}, LR={row['LR_R2_mean']:.3f}, GPR={row['GPR_R2_mean']:.3f})")
         if 'RF_vs_LR' in row:
-            report.append(f"                  {row['RF_vs_LR']}  |  {row['RF_vs_GPR']}  |  {row['LR_vs_GPR']}")
+            report.append(f"      KFold (naive):  {row['RF_vs_LR']}  |  {row['RF_vs_GPR']}  |  {row['LR_vs_GPR']}")
+        if 'RF_vs_LR_NB' in row:
+            report.append(f"      KFold (NB):     {row['RF_vs_LR_NB']}  |  {row['RF_vs_GPR_NB']}  |  {row['LR_vs_GPR_NB']}")
             
         # GroupKFold interpretation
         if 'RF_R2_group' in row and not pd.isna(row['RF_R2_group']):
@@ -392,7 +443,9 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
             report.append(f"      GroupKFold: Best = {best_g}  "
                           f"(RF={row['RF_R2_group']:.3f}, LR={row['LR_R2_group']:.3f}, GPR={row['GPR_R2_group']:.3f})")
             if 'RF_vs_LR_group' in row:
-                report.append(f"                  {row['RF_vs_LR_group']}  |  {row['RF_vs_GPR_group']}  |  {row['LR_vs_GPR_group']}")
+                report.append(f"      GroupKFold (naive): {row['RF_vs_LR_group']}  |  {row['RF_vs_GPR_group']}  |  {row['LR_vs_GPR_group']}")
+            if 'RF_vs_LR_group_NB' in row and pd.notna(row['RF_vs_LR_group_NB']):
+                report.append(f"      GroupKFold (NB):    {row['RF_vs_LR_group_NB']}  |  {row['RF_vs_GPR_group_NB']}  |  {row['LR_vs_GPR_group_NB']}")
     
     # ── 9. STANDARDIZED BETA COEFFICIENTS ──
     report.append("\n\n" + "=" * 80)
@@ -1148,13 +1201,36 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                 test_rf_gpr = format_ttest(rf_cv,  gpr_cv, 'RF', 'GPR')
                                 test_lr_gpr = format_ttest(lr_cv,  gpr_cv, 'LR', 'GPR')
                                 
+                                # Nadeau-Bengio corrected t-test (Item 1e)
+                                def format_nb(a, b, name_a, name_b):
+                                    t_stat, p_val = nadeau_bengio_ttest(a, b, cv_folds)
+                                    if np.isnan(p_val):
+                                        return 'N/A'
+                                    if p_val < 0.001: sig = f'*** (NB p={p_val:.4f})'
+                                    elif p_val < 0.01: sig = f'** (NB p={p_val:.4f})'
+                                    elif p_val < 0.05: sig = f'* (NB p={p_val:.4f})'
+                                    else: sig = f'ns (NB p={p_val:.4f})'
+                                    if np.mean(a) > np.mean(b):
+                                        return f'{name_a} > {name_b}: {sig}'
+                                    else:
+                                        return f'{name_b} > {name_a}: {sig}'
+                                
+                                test_rf_lr_nb  = format_nb(rf_cv,  lr_cv,  'RF', 'LR')
+                                test_rf_gpr_nb = format_nb(rf_cv,  gpr_cv, 'RF', 'GPR')
+                                test_lr_gpr_nb = format_nb(lr_cv,  gpr_cv, 'LR', 'GPR')
+                                
                                 # GroupKFold t-tests (Item 1d)
                                 if rf_cv_g is not None:
                                     test_rf_lr_g  = format_ttest(rf_cv_g,  lr_cv_g,  'RF', 'LR')
                                     test_rf_gpr_g = format_ttest(rf_cv_g,  gpr_cv_g, 'RF', 'GPR')
                                     test_lr_gpr_g = format_ttest(lr_cv_g,  gpr_cv_g, 'LR', 'GPR')
+                                    # GroupKFold Nadeau-Bengio (Item 1e)
+                                    test_rf_lr_g_nb  = format_nb(rf_cv_g,  lr_cv_g,  'RF', 'LR')
+                                    test_rf_gpr_g_nb = format_nb(rf_cv_g,  gpr_cv_g, 'RF', 'GPR')
+                                    test_lr_gpr_g_nb = format_nb(lr_cv_g,  gpr_cv_g, 'LR', 'GPR')
                                 else:
                                     test_rf_lr_g = test_rf_gpr_g = test_lr_gpr_g = 'N/A'
+                                    test_rf_lr_g_nb = test_rf_gpr_g_nb = test_lr_gpr_g_nb = 'N/A'
                                
                                 model_comparison.append({
                                     'Response': resp,
@@ -1165,6 +1241,10 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                     'RF_vs_LR': test_rf_lr,
                                     'RF_vs_GPR': test_rf_gpr,
                                     'LR_vs_GPR': test_lr_gpr,
+                                    # Nadeau-Bengio (Item 1e) — standard KFold
+                                    'RF_vs_LR_NB':  test_rf_lr_nb,
+                                    'RF_vs_GPR_NB': test_rf_gpr_nb,
+                                    'LR_vs_GPR_NB': test_lr_gpr_nb,
                                     # GroupKFold results (Item 1d)
                                     'RF_R2_group':  rf_cv_g.mean()  if rf_cv_g  is not None else np.nan,
                                     'LR_R2_group':  lr_cv_g.mean()  if lr_cv_g  is not None else np.nan,
@@ -1173,6 +1253,10 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                     'RF_vs_LR_group':  test_rf_lr_g,
                                     'RF_vs_GPR_group': test_rf_gpr_g,
                                     'LR_vs_GPR_group': test_lr_gpr_g,
+                                    # Nadeau-Bengio (Item 1e) — GroupKFold
+                                    'RF_vs_LR_group_NB':  test_rf_lr_g_nb,
+                                    'RF_vs_GPR_group_NB': test_rf_gpr_g_nb,
+                                    'LR_vs_GPR_group_NB': test_lr_gpr_g_nb,
                                 })
                             except Exception as ex:
                                 st.warning(f"CV failed for {resp}: {str(ex)[:80]}")
@@ -1183,10 +1267,13 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                     'GPR_R2_mean': np.nan, 'GPR_R2_std': np.nan,
                                     'Best': 'Error',
                                     'RF_vs_LR': 'N/A', 'RF_vs_GPR': 'N/A', 'LR_vs_GPR': 'N/A',
+                                    'RF_vs_LR_NB': 'N/A', 'RF_vs_GPR_NB': 'N/A', 'LR_vs_GPR_NB': 'N/A',
                                     'RF_R2_group': np.nan, 'LR_R2_group': np.nan,
                                     'GPR_R2_group': np.nan,
                                     'RF_vs_LR_group': 'N/A', 'RF_vs_GPR_group': 'N/A', 
                                     'LR_vs_GPR_group': 'N/A',
+                                    'RF_vs_LR_group_NB': 'N/A', 'RF_vs_GPR_group_NB': 'N/A',
+                                    'LR_vs_GPR_group_NB': 'N/A',
                                 })
                         df_mc = pd.DataFrame(model_comparison)
                         
@@ -1832,7 +1919,9 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                             # Display pairwise statistical tests
                             st.markdown("**Pairwise Model Comparisons (Paired t-test on CV folds)**")
                             test_cols = ['Response', 'RF_vs_LR', 'RF_vs_GPR', 'LR_vs_GPR',
-                                         'RF_vs_LR_group', 'RF_vs_GPR_group', 'LR_vs_GPR_group']
+                                         'RF_vs_LR_NB', 'RF_vs_GPR_NB', 'LR_vs_GPR_NB',
+                                         'RF_vs_LR_group', 'RF_vs_GPR_group', 'LR_vs_GPR_group',
+                                         'RF_vs_LR_group_NB', 'RF_vs_GPR_group_NB', 'LR_vs_GPR_group_NB']
                             st.dataframe(df_mc[test_cols], use_container_width=True)
                             st.caption("* p < 0.05, ** p < 0.01, *** p < 0.001, ns = not significant")
                             st.subheader("Standardized Regression Coefficients (β)")
