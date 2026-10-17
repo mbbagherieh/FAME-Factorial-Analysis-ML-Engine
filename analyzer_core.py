@@ -872,16 +872,39 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                         for resp in RESPONSE_COLS:
                             resp_data = df[resp].dropna().values
                             if len(resp_data) < 3:
-                                prelim_results[resp] = {'Shapiro_W': np.nan, 'Shapiro_p': np.nan,
-                                                       'Normality': 'Insufficient data', 'Levene_W': np.nan,
-                                                       'Levene_p': np.nan, 'Homogeneity': 'Insufficient data'}
+                                prelim_results[resp] = {
+                                    'Shapiro_W': np.nan, 'Shapiro_p': np.nan,
+                                    'Normality': 'Insufficient data',
+                                    'Shapiro_W_marginal': np.nan, 'Shapiro_p_marginal': np.nan,
+                                    'Levene_W': np.nan, 'Levene_p': np.nan,
+                                    'Homogeneity': 'Insufficient data'
+                                }
                                 continue
+                            
+                            # Marginal Shapiro (kept for reference only)
                             try:
-                                stat_shapiro, p_shapiro = shapiro(resp_data)
-                                normality = "Normal" if p_shapiro >= 0.05 else "Non-normal"
+                                stat_shapiro_marg, p_shapiro_marg = shapiro(resp_data)
+                            except:
+                                stat_shapiro_marg, p_shapiro_marg = np.nan, np.nan
+                            
+                            # Residual-based Shapiro (the correct assumption check)
+                            try:
+                                _main_eff = ' + '.join([f'C({f}_cat)' for f in FACTOR_COLS])
+                                if n_factors >= 2:
+                                    _inter = ' + '.join([f'C({f1}_cat):C({f2}_cat)'
+                                                          for f1, f2 in combinations(FACTOR_COLS, 2)])
+                                    _formula = f'Q("{resp}") ~ {_main_eff} + {_inter}'
+                                else:
+                                    _formula = f'Q("{resp}") ~ {_main_eff}'
+                                _df_model = df.dropna(subset=[resp])
+                                _model = ols(_formula, data=_df_model).fit()
+                                _residuals = _model.resid.values
+                                stat_shapiro, p_shapiro = shapiro(_residuals)
+                                normality = "Normal (residuals)" if p_shapiro >= 0.05 else "Non-normal (residuals)"
                             except:
                                 stat_shapiro, p_shapiro, normality = np.nan, np.nan, "Error"
-                           
+                            
+                            # Levene's test for homogeneity of variance
                             try:
                                 if n_factors >= 2:
                                     f1, f2 = FACTOR_COLS[0], FACTOR_COLS[1]
@@ -906,9 +929,13 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                     stat_levene, p_levene, homogeneity = np.nan, np.nan, "N/A"
                             except:
                                 stat_levene, p_levene, homogeneity = np.nan, np.nan, "Error"
+                            
                             prelim_results[resp] = {
                                 'Shapiro_W': stat_shapiro, 'Shapiro_p': p_shapiro,
-                                'Normality': normality, 'Levene_W': stat_levene,
+                                'Normality': normality,
+                                'Shapiro_W_marginal': stat_shapiro_marg,
+                                'Shapiro_p_marginal': p_shapiro_marg,
+                                'Levene_W': stat_levene,
                                 'Levene_p': p_levene, 'Homogeneity': homogeneity
                             }
                         
@@ -945,10 +972,9 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                             n_out = outlier_results[resp]['n_outliers']
                             prelim_rows.append({
                                 'Response': resp,
-                                'Shapiro-Wilk W': f"{pr['Shapiro_W']:.4f}" if not np.isnan(pr['Shapiro_W']) else 'N/A',
-                                'Shapiro p': f"{pr['Shapiro_p']:.4f}" if not np.isnan(pr['Shapiro_p']) else 'N/A',
-                                'Distribution': pr['Normality'],
-                                'Levene W': f"{pr['Levene_W']:.4f}" if not np.isnan(pr['Levene_W']) else 'N/A',
+                                'Shapiro p (resid)': f"{pr['Shapiro_p']:.4f}" if not np.isnan(pr['Shapiro_p']) else 'N/A',
+                                'Residuals': pr['Normality'],
+                                'Shapiro p (marg)': f"{pr['Shapiro_p_marginal']:.4f}" if not np.isnan(pr['Shapiro_p_marginal']) else 'N/A',
                                 'Levene p': f"{pr['Levene_p']:.4f}" if not np.isnan(pr['Levene_p']) else 'N/A',
                                 'Variances': pr['Homogeneity'],
                                 'IQR Bounds': outlier_results[resp]['IQR_bounds'],
@@ -1845,7 +1871,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                         with tab0:
                             st.subheader("Statistical Assumption Checks")
                             st.dataframe(df_prelim, use_container_width=True)
-                            non_normal = [r['Response'] for _,r in df_prelim.iterrows() if r['Distribution']=='Non-normal']
+                            non_normal = [r['Response'] for _,r in df_prelim.iterrows() if 'Non-normal' in str(r['Residuals'])]
                             unequal_var = [r['Response'] for _,r in df_prelim.iterrows() if r['Variances']=='Unequal']
                             if non_normal: st.warning(f"⚠️ Non-normal distribution: {', '.join(non_normal)}")
                             if unequal_var: st.warning(f"⚠️ Unequal variances: {', '.join(unequal_var)}")
