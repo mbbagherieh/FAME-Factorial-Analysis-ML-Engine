@@ -1778,6 +1778,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                         kernel=RBF(length_scale=1.0, length_scale_bounds=(0.1, 10.0))
                                              + WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-3, 1.0)),
                                         n_restarts_optimizer=10,
+                                        normalize_y=True,
                                         random_state=random_state)
                                 )
                                 
@@ -2317,7 +2318,7 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                 scaler_y = StandardScaler(); yp_s = scaler_y.fit_transform(yp.reshape(-1,1)).flatten()
                                 kernel = ConstantKernel(1.0,(1e-3,1e3))*RBF([1.0,1.0],(0.5,10.0))+WhiteKernel(0.1,(1e-3,1.0))
                                 try:
-                                    gpr = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=15, random_state=random_state)
+                                    gpr = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=15, normalize_y=True, random_state=random_state)
                                     gpr.fit(Xp_s, yp_s)
                                     yp_pred_s = gpr.predict(Xp_s)
                                     ss_res = np.sum((yp_s-yp_pred_s)**2); ss_tot = np.sum((yp_s-yp_s.mean())**2)
