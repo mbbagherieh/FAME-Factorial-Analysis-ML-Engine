@@ -220,6 +220,45 @@ def run_seed_stability(X_ml, Y_ml, factors, n_responses, rf_estimators,
         'seeds': seeds,
     }
 
+def compute_effect_sizes(df_term, df_error, ss_term, ss_error, ms_error, n_total):
+    """
+    Compute classical effect sizes for one ANOVA term (Item 1k).
+    
+    Parameters
+    ----------
+    df_term : int     Degrees of freedom for this term
+    df_error : int    Degrees of freedom for residuals
+    ss_term : float   Sum of squares for this term
+    ss_error : float  Sum of squares for residuals
+    ms_error : float  Mean square error
+    n_total : int     Total sample size
+    
+    Returns
+    -------
+    dict with:
+      'eta2'     : classical eta-squared (SS_term / SS_total)
+      'partial_eta2' : SS_term / (SS_term + SS_error)
+      'omega2'   : SS_term - df_term * MS_error, divided by (SS_total + MS_error)
+      'epsilon2' : SS_term - df_term * MS_error, divided by SS_total
+    """
+    ss_total = ss_term + ss_error  # only for this comparison
+    # Classical eta-squared
+    eta2 = ss_term / ss_total if ss_total > 0 else np.nan
+    # Partial eta-squared (as currently reported)
+    partial_eta2 = ss_term / (ss_term + ss_error) if (ss_term + ss_error) > 0 else np.nan
+    # Omega-squared (less biased than eta-squared)
+    numerator = ss_term - df_term * ms_error
+    denominator = ss_total + ms_error
+    omega2 = numerator / denominator if denominator > 0 else np.nan
+    # Epsilon-squared (alternative less-biased estimator)
+    epsilon2 = numerator / ss_total if ss_total > 0 else np.nan
+    return {
+        'eta2': float(eta2),
+        'partial_eta2': float(partial_eta2),
+        'omega2': float(omega2),
+        'epsilon2': float(epsilon2),
+    }
+
 def morf_out_of_fold_residuals(X_ml, Y_ml, cv_folds=5, rf_estimators=200,
                                 random_state=42):
     """
@@ -551,7 +590,7 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
     for resp in RESPONSE_COLS:
         if resp in full_anova_tables:
             report.append(f"\n--- {resp} ---")
-            cols_show = [c for c in ['sum_sq','df','F','PR(>F)','η²','q_within']
+            cols_show = [c for c in ['sum_sq','df','F','PR(>F)','η²','ω²','ε²','q_within']
                          if c in full_anova_tables[resp].columns]
             report.append(full_anova_tables[resp][cols_show].round(6).to_string())
             
@@ -571,9 +610,14 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
         report.append("\n\n" + "=" * 80)
         report.append("4b. ANOVA WITH FDR CORRECTION (Benjamini-Hochberg)")
         report.append("=" * 80)
+        report.append("\nEffect sizes reported: η² (classical eta-squared), ω² (omega-squared,")
+        report.append("less biased at small n), ε² (epsilon-squared). Partial η² is not")
+        report.append("directly comparable across designs with different numbers of factors")
+        report.append("or levels; ω² and ε² are preferred for meta-analytic comparison.")
         report.append("\nq_within = BH correction across terms within a response")
         report.append("q_across = BH correction across responses for the same term\n")
-        cols_fdr = ['Response','Term','F','p_raw','q_within','q_across','η²']
+        cols_fdr = [c for c in ['Response','Term','F','p_raw','q_within','q_across','η²','ω²','ε²']
+                    if c in df_anova_fdr.columns]
         report.append(df_anova_fdr[cols_fdr].round(6).to_string(index=False))
         
         surviving = df_anova_fdr[(df_anova_fdr['q_within'] < 0.05) | 
@@ -1479,6 +1523,24 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                     if idx_row != 'Residual':
                                         eta_sq[idx_row] = atbl.loc[idx_row,'sum_sq']/(atbl.loc[idx_row,'sum_sq']+ss_error)
                                 atbl['η²'] = [eta_sq.get(idx,np.nan) for idx in atbl.index]
+                                # ---- Classical and bias-corrected effect sizes (Item 1k) ----
+                                ms_error = atbl.loc['Residual', 'sum_sq'] / atbl.loc['Residual', 'df']
+                                for idx_row in atbl.index:
+                                    if idx_row == 'Residual':
+                                        continue
+                                    try:
+                                        es = compute_effect_sizes(
+                                            df_term=atbl.loc[idx_row, 'df'],
+                                            df_error=atbl.loc['Residual', 'df'],
+                                            ss_term=atbl.loc[idx_row, 'sum_sq'],
+                                            ss_error=atbl.loc['Residual', 'sum_sq'],
+                                            ms_error=ms_error,
+                                            n_total=len(df_anova))
+                                        atbl.loc[idx_row, 'ω²'] = es['omega2']
+                                        atbl.loc[idx_row, 'ε²'] = es['epsilon2']
+                                    except Exception:
+                                        atbl.loc[idx_row, 'ω²'] = np.nan
+                                        atbl.loc[idx_row, 'ε²'] = np.nan
                                 # Remove Intercept row from display (Type III includes it)
                                 if 'Intercept' in atbl.index:
                                     atbl = atbl.drop('Intercept')
@@ -1532,6 +1594,8 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                     'p_raw': atbl.loc[term, 'PR(>F)'],
                                     'q_within': atbl.loc[term, 'q_within'],
                                     'η²': atbl.loc[term, 'η²'],
+                                    'ω²': atbl.loc[term, 'ω²'] if 'ω²' in atbl.columns else np.nan,
+                                    'ε²': atbl.loc[term, 'ε²'] if 'ε²' in atbl.columns else np.nan,
                                 })
                         df_anova_fdr = pd.DataFrame(anova_fdr_records)
                         
