@@ -220,6 +220,46 @@ def run_seed_stability(X_ml, Y_ml, factors, n_responses, rf_estimators,
         'seeds': seeds,
     }
 
+def morf_out_of_fold_residuals(X_ml, Y_ml, cv_folds=5, rf_estimators=200,
+                                random_state=42):
+    """
+    Compute MORF residual correlations using out-of-fold predictions (Item 1j).
+    
+    For each fold:
+      1. Fit a multi-output Random Forest on training rows
+      2. Predict on held-out rows
+      3. Collect residuals (observed - predicted) for held-out rows
+    
+    Correlate the collected out-of-fold residuals across all responses.
+    
+    Returns
+    -------
+    resid_corr_oof : (n_responses, n_responses) ndarray
+        Pearson correlation matrix of out-of-fold residuals.
+    """
+    n_samples, n_responses = Y_ml.shape
+    resid_oof = np.zeros_like(Y_ml, dtype=float)
+    
+    kf = KFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
+    
+    for train_idx, test_idx in kf.split(X_ml):
+        rf = RandomForestRegressor(
+            n_estimators=rf_estimators, max_depth=None,
+            min_samples_leaf=2, random_state=random_state, n_jobs=-1)
+        rf.fit(X_ml[train_idx], Y_ml[train_idx])
+        predictions = rf.predict(X_ml[test_idx])
+        resid_oof[test_idx] = Y_ml[test_idx] - predictions
+    
+    # Correlate residuals across responses
+    with np.errstate(invalid='ignore', divide='ignore'):
+        resid_corr = np.corrcoef(resid_oof.T)
+    
+    # Handle NaN (constant columns)
+    resid_corr = np.nan_to_num(resid_corr, nan=0.0)
+    np.fill_diagonal(resid_corr, 1.0)
+    
+    return resid_corr
+
 def simple_effects(df, response, factor_fixed, factor_contrast):
     """
     Test the effect of `factor_fixed` at each level of `factor_contrast`.
@@ -395,7 +435,8 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
                          source_file_name=None, n_rows_raw=None,
                          n_rows_anova=None, n_rows_ml=None, n_rows_dropped=None,
                          df_anova_fdr=None, df_art=None, df_simple=None,
-                         stability_results=None, shap_null_results=None):
+                         stability_results=None, shap_null_results=None,
+                         resid_corr_oof=None):
     """Generate a comprehensive text report of all analyses."""
     
     report = []
@@ -844,6 +885,56 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
         report.append("\nStrong residual correlations (|r| > 0.5):")
         for r1, r2, val in strong_resid:
             report.append(f"  • {r1} ↔ {r2}: r = {val:.3f}")
+
+    # ── 11b. OUT-OF-FOLD MORF RESIDUALS (Item 1j) ──
+    if resid_corr_oof is not None and n_responses >= 2:
+        report.append("\n\n" + "=" * 80)
+        report.append("11b. OUT-OF-FOLD MORF RESIDUAL CORRELATIONS (Item 1j)")
+        report.append("=" * 80)
+        report.append("\nResiduals computed from held-out fold predictions, not")
+        report.append("in-sample predictions. This removes RF memorization bias,")
+        report.append("giving an honest estimate of trait coupling after treatment.")
+        
+        # Format table
+        header = "".ljust(15) + " ".join([f"{r[:10]:>10}" for r in RESPONSE_COLS])
+        report.append("\n" + header)
+        report.append("-" * len(header))
+        for i, resp_i in enumerate(RESPONSE_COLS):
+            row_str = f"{resp_i[:14]:<15} " + " ".join(
+                [f"{resid_corr_oof[i, j]:>10.3f}" for j in range(n_responses)])
+            report.append(row_str)
+        
+        # Strong residual correlations
+        strong_oof = []
+        for i in range(n_responses):
+            for j in range(i+1, n_responses):
+                if abs(resid_corr_oof[i, j]) > 0.5:
+                    strong_oof.append((RESPONSE_COLS[i], RESPONSE_COLS[j],
+                                        resid_corr_oof[i, j]))
+        
+        if strong_oof:
+            report.append("\nStrong out-of-fold correlations (|r| > 0.5):")
+            for r1, r2, val in strong_oof:
+                report.append(f"  • {r1} ↔ {r2}: r = {val:.3f}")
+        else:
+            report.append("\nNo out-of-fold correlations exceed |r| = 0.5.")
+        
+        # Comparison with in-sample
+        report.append("\n\nComparison with in-sample correlations:")
+        report.append(f"{'Pair':<40} {'In-sample':>10} {'Out-of-fold':>12} {'Δ':>8}")
+        report.append("-" * 72)
+        comparisons = []
+        for i in range(n_responses):
+            for j in range(i+1, n_responses):
+                r_in = resid_corr[i, j]
+                r_oof = resid_corr_oof[i, j]
+                if abs(r_in) > 0.4 or abs(r_oof) > 0.4:
+                    comparisons.append((RESPONSE_COLS[i], RESPONSE_COLS[j],
+                                         r_in, r_oof))
+        comparisons.sort(key=lambda x: -abs(x[2]))
+        for r1, r2, r_in, r_oof in comparisons[:10]:
+            pair = f"{r1[:18]} ↔ {r2[:18]}"
+            report.append(f"{pair:<40} {r_in:>10.3f} {r_oof:>12.3f} {r_oof - r_in:>+8.3f}")
     
     # ── SUMMARY ──
     report.append("\n\n" + "=" * 80)
@@ -1742,6 +1833,18 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                         except Exception:
                             resid_corr = np.eye(max(n_responses, 1))
 
+                        # ---- Out-of-fold MORF residuals (Item 1j) ----
+                        resid_corr_oof = None
+                        if n_responses >= 2:
+                            try:
+                                resid_corr_oof = morf_out_of_fold_residuals(
+                                    X_ml, Y_ml, cv_folds=cv_folds,
+                                    rf_estimators=rf_estimators,
+                                    random_state=random_state)
+                            except Exception as ex:
+                                st.warning(f"Out-of-fold MORF failed: {str(ex)[:80]}")
+                                resid_corr_oof = None
+
                         # ---- Multi-seed stability analysis (Item 1l) ----
                         stability_results = None
                         if stability_seeds > 1:
@@ -2441,7 +2544,8 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                 df_art=df_art,
                                 df_simple=df_simple,
                                 stability_results=stability_results,
-                                shap_null_results=shap_null_results
+                                shap_null_results=shap_null_results,
+                                resid_corr_oof=resid_corr_oof
                             )
                             
                             zip_buffer = io.BytesIO()
