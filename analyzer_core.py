@@ -624,8 +624,41 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
                                  (df_anova_fdr['q_across'] < 0.05)]
         report.append(f"\nEffects surviving FDR (q < 0.05, either correction): "
                       f"{len(surviving)} of {len(df_anova_fdr)}")
-    
-    
+        # ---- Multiplicity summary (Item 2c) ----
+        report.append("\n" + "-" * 80)
+        report.append("MULTIPLICITY SAFEGUARD SUMMARY")
+        report.append("-" * 80)
+        n_total = len(df_anova_fdr)
+        n_sig_raw = int((df_anova_fdr['p_raw'] < 0.05).sum())
+        n_sig_qwithin = int((df_anova_fdr['q_within'] < 0.05).sum())
+        n_sig_qacross = int((df_anova_fdr['q_across'] < 0.05).sum())
+        n_sig_either = int(((df_anova_fdr['q_within'] < 0.05) | 
+                            (df_anova_fdr['q_across'] < 0.05)).sum())
+        
+        report.append(f"\nThis report contains {n_total} ANOVA p-values across")
+        report.append(f"{len(RESPONSE_COLS)} response(s) and {len(full_anova_tables[RESPONSE_COLS[0]])} term(s).")
+        report.append(f"\n   Raw p < 0.05:              {n_sig_raw:>3} of {n_total}")
+        report.append(f"   q_within < 0.05 (BH):      {n_sig_qwithin:>3} of {n_total}")
+        report.append(f"   q_across < 0.05 (BH):      {n_sig_qacross:>3} of {n_total}")
+        report.append(f"   q < 0.05 under either:     {n_sig_either:>3} of {n_total}")
+        
+        # Effects lost under correction
+        lost = df_anova_fdr[(df_anova_fdr['p_raw'] < 0.05) & 
+                            (df_anova_fdr['q_within'] >= 0.05) & 
+                            (df_anova_fdr['q_across'] >= 0.05)]
+        if len(lost) > 0:
+            report.append(f"\nEffects significant at raw p < 0.05 but NOT surviving")
+            report.append(f"either FDR correction (interpret with caution):")
+            for _, row in lost.iterrows():
+                report.append(f"   • {row['Response']:<15} {row['Term']:<40} "
+                              f"p={row['p_raw']:.4f}  q_within={row['q_within']:.4f}  q_across={row['q_across']:.4f}")
+        else:
+            report.append("\nAll effects significant at raw p < 0.05 also survive FDR correction.")
+        
+        report.append("\nNote: q_across is stricter when the same term is tested across many")
+        report.append("responses. Use q_within for within-response claims, q_across for")
+        report.append("cross-response claims (e.g., 'factor X affects all responses').")
+        
     if len(df_int) > 0:
         sig_int_df = df_int[df_int['Sig.'] != 'ns']
         if len(sig_int_df) > 0:
@@ -1076,6 +1109,12 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
              "Tukey's HSD is more conservative (controls family-wise error rate, recommended for ≥3 groups). "
              "Fisher's LSD is more liberal (higher power but greater risk of false positives)."
     )
+    if posthoc_method == "Fisher's LSD":
+        st.sidebar.warning(
+            "⚠️ Fisher's LSD does not control family-wise error rate. "
+            "False positive risk increases with the number of groups. "
+            "Use Tukey's HSD for ≥3 groups unless you have a specific reason to prefer LSD."
+        )
     
     st.sidebar.subheader("Advanced Settings")
     n_categories = st.sidebar.slider(
