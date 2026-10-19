@@ -102,6 +102,67 @@ def nadeau_bengio_ttest(a, b, K):
     p_value = 2.0 * (1.0 - t_dist.cdf(abs(t_stat), df))
     return float(t_stat), float(p_value)
 
+def shap_null_and_bootstrap(X_ml, Y_ml, n_responses, rf_estimators=100,
+                              n_permutations=50, n_bootstrap=100,
+                              n_jobs=-1, random_state=42):
+    """
+    Compute null distribution and bootstrap CIs for SHAP importance (Item 1f).
+    """
+    from joblib import Parallel, delayed
+    
+    n_factors = X_ml.shape[1]
+    
+    def _shap_importance(X, y, seed):
+        try:
+            rf = RandomForestRegressor(n_estimators=rf_estimators, max_depth=None,
+                                        min_samples_leaf=2, random_state=seed, n_jobs=1)
+            rf.fit(X, y)
+            explainer = shap.TreeExplainer(rf)
+            sv = np.abs(explainer.shap_values(X)).mean(axis=0)
+            return 100.0 * sv / sv.sum()
+        except Exception:
+            return np.full(n_factors, np.nan)
+    
+    # Real fit
+    real_shap = np.zeros((n_responses, n_factors))
+    for j in range(n_responses):
+        real_shap[j, :] = _shap_importance(X_ml, Y_ml[:, j], random_state)
+    
+    # Null distribution
+    def _null_fit(j, perm_idx):
+        rng = np.random.default_rng(random_state + perm_idx * 1000 + j)
+        y_perm = Y_ml[rng.permutation(len(Y_ml)), j]
+        return _shap_importance(X_ml, y_perm, random_state + perm_idx)
+    
+    null_results = Parallel(n_jobs=n_jobs, verbose=0)(
+        delayed(_null_fit)(j, p) for j in range(n_responses) for p in range(n_permutations)
+    )
+    null_arr = np.array(null_results).reshape(n_responses, n_permutations, n_factors)
+    null_p95 = np.nanpercentile(null_arr, 95, axis=1)
+    
+    # Bootstrap
+    def _boot_fit(j, boot_idx):
+        rng = np.random.default_rng(random_state + boot_idx * 1000 + j)
+        idx = rng.integers(0, len(X_ml), size=len(X_ml))
+        return _shap_importance(X_ml[idx], Y_ml[idx, j], random_state + boot_idx)
+    
+    boot_results = Parallel(n_jobs=n_jobs, verbose=0)(
+        delayed(_boot_fit)(j, b) for j in range(n_responses) for b in range(n_bootstrap)
+    )
+    boot_arr = np.array(boot_results).reshape(n_responses, n_bootstrap, n_factors)
+    boot_lower = np.nanpercentile(boot_arr, 2.5, axis=1)
+    boot_upper = np.nanpercentile(boot_arr, 97.5, axis=1)
+    
+    exceeds_null = real_shap > null_p95
+    
+    return {
+        'null_p95': null_p95,
+        'real_mean': real_shap,
+        'boot_ci_lower': boot_lower,
+        'boot_ci_upper': boot_upper,
+        'exceeds_null': exceeds_null,
+    }
+
 def run_seed_stability(X_ml, Y_ml, factors, n_responses, rf_estimators,
                         cv_folds, n_seeds=20):
     """
@@ -334,7 +395,7 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
                          source_file_name=None, n_rows_raw=None,
                          n_rows_anova=None, n_rows_ml=None, n_rows_dropped=None,
                          df_anova_fdr=None, df_art=None, df_simple=None,
-                         stability_results=None):
+                         stability_results=None, shap_null_results=None):
     """Generate a comprehensive text report of all analyses."""
     
     report = []
@@ -669,16 +730,17 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
             if 'RF_vs_LR_group_NB' in row and pd.notna(row['RF_vs_LR_group_NB']):
                 report.append(f"      GroupKFold (NB):    {row['RF_vs_LR_group_NB']}  |  {row['RF_vs_GPR_group_NB']}  |  {row['LR_vs_GPR_group_NB']}")
 
-    # ── 8c. MULTI-SEED STABILITY ──
+    # ── 8c. MULTI-SEED STABILITY ── 
     if stability_results is not None:
+        n_seeds_used = len(stability_results.get('seeds', [])) or 20
         report.append("\n\n" + "=" * 80)
-        report.append("8c. MULTI-SEED STABILITY (20 seeds)")
+        report.append(f"8c. MULTI-SEED STABILITY ({n_seeds_used} seeds)")
         report.append("=" * 80)
-        report.append("\nAssesses variability of SHAP importances and CV R² across 20 random seeds.")
+        report.append(f"\nAssesses variability of SHAP importances and CV R² across {n_seeds_used} random seeds.")
         report.append("A small SD indicates results are not dependent on the specific seed.\n")
         
         # SHAP stability
-        report.append("SHAP importance (%) — mean ± SD across 20 seeds:")
+        report.append("SHAP importance (%) — mean ± SD across seeds:")
         header = "Response".ljust(20) + "  " + "  ".join([f"{f:>18}" for f in FACTOR_COLS])
         report.append(header)
         report.append("-" * len(header))
@@ -689,12 +751,45 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
             report.append(resp.ljust(20) + "  " + "  ".join([f"{c:>18}" for c in cells]))
         
         # CV R² stability
-        report.append("\n\nCV R² (RF) — mean ± SD across 20 seeds:")
+        report.append("\n\nCV R² (RF) — mean ± SD across seeds:")
         report.append(f"{'Response':<20} {'Mean R²':>10} {'SD R²':>10}")
         report.append("-" * 42)
         for j, resp in enumerate(RESPONSE_COLS):
             report.append(f"{resp:<20} {stability_results['cv_r2_mean'][j]:>10.3f} "
                           f"{stability_results['cv_r2_sd'][j]:>10.3f}")
+    
+    # ── 8d. SHAP NULL AND BOOTSTRAP (Item 1f) ──
+    if shap_null_results is not None:
+        report.append("\n\n" + "=" * 80)
+        report.append("8d. SHAP IMPORTANCE: NULL DISTRIBUTION AND BOOTSTRAP CI")
+        report.append("=" * 80)
+        report.append("\nNull distribution: response permuted 50 times; 95th percentile of")
+        report.append("null SHAP is the chance threshold. Real SHAP values below this")
+        report.append("threshold are not distinguishable from noise.")
+        report.append("Bootstrap: data resampled 100 times; 2.5th and 97.5th percentiles")
+        report.append("form the 95% CI.")
+        report.append("")
+        
+        for j, resp in enumerate(RESPONSE_COLS):
+            report.append(f"\n--- {resp} ---")
+            report.append(f"{'Factor':<20} {'Real %':>8} {'Null p95':>10} "
+                          f"{'95% CI':>20} {'vs Null':>8}")
+            report.append("-" * 70)
+            for i, factor in enumerate(FACTOR_COLS):
+                real = shap_null_results['real_mean'][j, i]
+                null_p95 = shap_null_results['null_p95'][j, i]
+                ci_lo = shap_null_results['boot_ci_lower'][j, i]
+                ci_hi = shap_null_results['boot_ci_upper'][j, i]
+                exceeds = shap_null_results['exceeds_null'][j, i]
+                marker = '✓' if exceeds else '✗'
+                report.append(f"{factor:<20} {real:>8.2f} {null_p95:>10.2f} "
+                              f"[{ci_lo:>6.2f}, {ci_hi:>6.2f}] {'':>6} {marker:>5}")
+        
+        # Summary
+        n_exceeding = int(np.sum(shap_null_results['exceeds_null']))
+        n_total = shap_null_results['exceeds_null'].size
+        report.append(f"\nFactor–response pairs exceeding null threshold: "
+                      f"{n_exceeding} of {n_total}")
     
     # ── 9. STANDARDIZED BETA COEFFICIENTS ──
     report.append("\n\n" + "=" * 80)
@@ -874,6 +969,23 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
         min_value=50, max_value=500, value=200, step=50,
         help="Number of decision trees in the Random Forest model. "
              "More trees (e.g., 300-500) give smoother, more stable results but increase computation time."
+    )
+    stability_seeds = st.sidebar.selectbox(
+        "Stability seed repeats",
+        options=[1, 5, 10, 20],
+        index=1,  # default = 5
+        help="Number of random seeds for SHAP and CV R² stability analysis. "
+             "1 = skip stability analysis, 5 = quick check (~1–2 min), "
+             "20 = publication-grade (~3–5 min)."
+    )
+    
+    run_shap_null = st.sidebar.checkbox(
+        "Run SHAP null distribution and bootstrap CI",
+        value=False,
+        help="Permutes the response 50× and bootstraps the data 100× to determine "
+             "which SHAP importances are distinguishable from chance. "
+             "Adds 10–20 minutes for large datasets; recommended only for "
+             "final analyses intended for publication."
     )
     random_state = st.sidebar.number_input(
         "Random seed",
@@ -1631,16 +1743,31 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                             resid_corr = np.eye(max(n_responses, 1))
 
                         # ---- Multi-seed stability analysis (Item 1l) ----
-                        progress_bar.progress(55, text="Running multi-seed stability analysis...")
-                        try:
-                            stability_results = run_seed_stability(
-                                X_ml, Y_ml, FACTOR_COLS, n_responses,
-                                rf_estimators=rf_estimators,
-                                cv_folds=cv_folds, n_seeds=20)
-                        except Exception as ex:
-                            st.warning(f"Stability analysis failed: {str(ex)[:100]}")
-                            stability_results = None
+                        stability_results = None
+                        if stability_seeds > 1:
+                            progress_bar.progress(55, text=f"Running stability analysis ({stability_seeds} seeds)...")
+                            try:
+                                stability_results = run_seed_stability(
+                                    X_ml, Y_ml, FACTOR_COLS, n_responses,
+                                    rf_estimators=rf_estimators,
+                                    cv_folds=cv_folds, n_seeds=stability_seeds)
+                            except Exception as ex:
+                                st.warning(f"Stability analysis failed: {str(ex)[:100]}")
+                                stability_results = None
 
+                        # ---- SHAP null distribution and bootstrap (Item 1f) ----
+                        shap_null_results = None
+                        if run_shap_null:
+                            progress_bar.progress(57, text="Running SHAP null distribution and bootstrap (this may take several minutes)...")
+                            try:
+                                shap_null_results = shap_null_and_bootstrap(
+                                    X_ml, Y_ml, n_responses,
+                                    rf_estimators=100,
+                                    n_permutations=50, n_bootstrap=100,
+                                    n_jobs=-1, random_state=random_state)
+                            except Exception as ex:
+                                st.warning(f"SHAP null/bootstrap failed: {str(ex)[:100]}")
+                                shap_null_results = None
                         
                         progress_bar.progress(60, text="Running PCA...")
                         
@@ -2313,7 +2440,8 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                 df_anova_fdr=df_anova_fdr,
                                 df_art=df_art,
                                 df_simple=df_simple,
-                                stability_results=stability_results
+                                stability_results=stability_results,
+                                shap_null_results=shap_null_results
                             )
                             
                             zip_buffer = io.BytesIO()
