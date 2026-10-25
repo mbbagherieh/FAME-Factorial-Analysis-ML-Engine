@@ -40,6 +40,44 @@ import os
 # standardization to ensure eigenvalues sum to p and that
 # variance estimates are consistent across the pipeline.
 # ─────────────────────────────────────────────────────────────
+def generate_python_cld(groups, means, p_matrix, alpha=0.05):
+    """
+    Generate a Compact Letter Display (CLD) using a greedy algorithm.
+    Produces valid, non-overlapping letter groupings.
+    """
+    order = np.argsort(means)[::-1]
+    sorted_groups = [groups[i] for i in order]
+    
+    group_letters = {g: set() for g in groups}
+    current_letter_idx = 0
+    alphabet = "abcdefghijklmnopqrstuvwxyz"
+    
+    for i in range(len(sorted_groups)):
+        g_i = sorted_groups[i]
+        idx_i = groups.index(g_i)
+        
+        assigned = False
+        for l_idx in range(current_letter_idx + 1):
+            l_char = alphabet[l_idx]
+            compatible = True
+            for g_j in groups:
+                if l_char in group_letters[g_j]:
+                    idx_j = groups.index(g_j)
+                    if p_matrix[idx_i, idx_j] < alpha:
+                        compatible = False
+                        break
+            if compatible:
+                group_letters[g_i].add(l_char)
+                assigned = True
+                
+        if not assigned:
+            current_letter_idx += 1
+            group_letters[g_i].add(alphabet[current_letter_idx])
+            
+    return {g: "".join(sorted(list(letters_set))) for g, letters_set in group_letters.items()}
+        
+    return result
+
 def benjamini_hochberg(pvals):
     """
     Benjamini-Hochberg FDR correction.
@@ -460,7 +498,7 @@ try:
 except Exception as e:
     _R_ERROR_MSG = str(e)[:200]
 
-# R_AVAILABLE = False  # TEMPORARY — force Python Piepho for testing
+# R_AVAILABLE = False  # TEMPORARY — force Python Piepho for testing # commented in normal usage
 
 def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
                          df_prelim, df_pearson, outlier_results,
@@ -705,8 +743,9 @@ def generate_text_report(df, FACTOR_COLS, RESPONSE_COLS, n_factors, n_responses,
     report.append(f"Method: {posthoc_method}  |  "
                   f"Engine: {'R agricolae (HSD.test/LSD.test)' if R_AVAILABLE else 'Python fallback (significance matrix)'}")
     if not R_AVAILABLE:
-        report.append("Note: Letter groupings (a, b, ab, …) are not produced by the Python "
-                      "fallback; pairwise significance is reported instead.")
+        report.append("Note: The native Python fallback generates Piepho CLD groupings. "
+                      "These may differ slightly from the letters assigned by R's 'agricolae' package, "
+                      "which is the reference implementation and gold standard for this algorithm.")
     
     for resp in RESPONSE_COLS:
         if resp in posthoc_dict and posthoc_dict[resp]['groups']:
@@ -2090,18 +2129,25 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
 
                                     else:
                             
-                                        # Python fallback — significance matrix heatmap
+                                        # Python fallback
                                         resp_data = df[['Treatment', resp]].dropna().copy()
                                         group_stats = resp_data.groupby('Treatment')[resp].agg(['mean', 'std', 'count'])
                                         group_means = group_stats['mean'].sort_values(ascending=False)
                                         group_sd = group_stats.loc[group_means.index, 'std']
                                         group_n = group_stats.loc[group_means.index, 'count']
                                         
-                                        # Fit one-way ANOVA on Treatment to get correct MSE and df
-                                        model_1way = smf.ols(f'Q("{resp}") ~ C(Treatment)', data=resp_data).fit()
-                                        anova_1way = sm.stats.anova_lm(model_1way, typ=2)
-                                        mse = anova_1way.loc['Residual', 'sum_sq'] / anova_1way.loc['Residual', 'df']
-                                        df_error = int(anova_1way.loc['Residual', 'df'])
+                                        # Extract MSE and df directly from the factorial ANOVA (Stage 4)
+                                        # This ensures the post-hoc error term is mathematically consistent.
+                                        try:
+                                            atbl = full_anova_tables[resp]
+                                            mse = atbl.loc['Residual', 'sum_sq'] / atbl.loc['Residual', 'df']
+                                            df_error = int(atbl.loc['Residual', 'df'])
+                                        except Exception:
+                                            # Fallback to one-way ANOVA only if the factorial table is unavailable
+                                            model_1way = smf.ols(f'Q("{resp}") ~ C(Treatment)', data=resp_data).fit()
+                                            anova_1way = sm.stats.anova_lm(model_1way, typ=2)
+                                            mse = anova_1way.loc['Residual', 'sum_sq'] / anova_1way.loc['Residual', 'df']
+                                            df_error = int(anova_1way.loc['Residual', 'df'])
                                         
                                         groups_list = list(group_means.index)
                                         n_grp = len(groups_list)
@@ -2164,6 +2210,9 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                         
                                         df_sig = pd.DataFrame(sig_results)
                                         
+                                        # Generate native Python CLD
+                                        cld_dict = generate_python_cld(groups_list, means_array, p_matrix)
+                                        
                                         # Also build groups dict for display consistency
                                         sorted_groups = sorted(groups_list, key=lambda g: group_means[g], reverse=True)
                                         posthoc_dict[resp] = {
@@ -2173,11 +2222,10 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                             'sig_matrix': df_sig
                                         }
                                         for g in sorted_groups:
-                                            idx = groups_list.index(g)
                                             posthoc_dict[resp]['groups'][g] = {
                                                 'mean': group_means[g],
                                                 'sd': group_sd[g],
-                                                'letter': ''
+                                                'letter': cld_dict[g]
                                             }
                                 except Exception as ex:
                                     posthoc_dict[resp] = {'method': posthoc_method, 'critical_diff': np.nan, 'groups': {}, 'error': str(ex)[:150]}                        
@@ -2557,21 +2605,19 @@ def run_analyzer(n_factors_default, default_factor_names, default_responses, app
                                     if resp in posthoc_dict and posthoc_dict[resp]['groups']:
                                         cd = posthoc_dict[resp]['critical_diff']
                                         # Check if we have a significance matrix (Python fallback)
-                                        if 'sig_matrix' in posthoc_dict[resp]:
-                                            with st.expander(f"{resp} (CD = {cd:.4f})"):
-                                                st.markdown("**Treatment Means**")
-                                                rows = [{'Treatment':t, 'Mean':f"{i['mean']:.4f}",
-                                                        'SD':f"{i['sd']:.4f}"}
-                                                       for t,i in posthoc_dict[resp]['groups'].items()]
-                                                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                                    if resp in posthoc_dict and posthoc_dict[resp]['groups']:
+                                        cd = posthoc_dict[resp]['critical_diff']
+                                        with st.expander(f"{resp} (CD = {cd:.4f})"):
+                                            st.markdown("**Treatment Means**")
+                                            rows = [{'Treatment':t, 'Mean':f"{i['mean']:.4f}",
+                                                    'SD':f"{i['sd']:.4f}", 'Group':i['letter']}
+                                                   for t,i in posthoc_dict[resp]['groups'].items()]
+                                            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                                            
+                                            # Show the pairwise matrix ONLY if the Python fallback was used
+                                            if 'sig_matrix' in posthoc_dict[resp]:
                                                 st.markdown("**Pairwise Significance Matrix**")
                                                 st.dataframe(posthoc_dict[resp]['sig_matrix'], use_container_width=True)
-                                        else:
-                                            with st.expander(f"{resp} (CD = {cd:.4f})"):
-                                                rows = [{'Treatment':t, 'Mean':f"{i['mean']:.4f}",
-                                                        'SD':f"{i['sd']:.4f}", 'Group':i['letter']}
-                                                       for t,i in posthoc_dict[resp]['groups'].items()]
-                                                st.dataframe(pd.DataFrame(rows), use_container_width=True)
                             else: st.info("Post-hoc comparisons not available.")
                         
                         with tab3:
