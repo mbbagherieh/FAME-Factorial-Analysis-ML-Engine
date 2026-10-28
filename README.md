@@ -3,38 +3,51 @@
 A comprehensive, open-source Python pipeline for statistical and machine learning analysis of factorial plant experiments.
 
 ## Features
-
-- N-way ANOVA with effect sizes (η²)
-- Kruskal-Wallis non-parametric validation
-- Post-hoc mean comparisons (Tukey's HSD / Fisher's LSD) via R's agricolae
-- SHAP feature importance with permutation validation
-- Random Forest, Linear Regression, and Gaussian Process Regression with cross-validation
-- Bootstrap confidence intervals for standardized regression coefficients
-- Multi-Output Random Forest residual correlation analysis
-- Principal Component Analysis with biplot visualization
-- GPR interaction response surfaces
-- Publication-ready figures (600 DPI PNG + PDF, A4 single/two-column layouts)
-- Comprehensive text report generation
-- Streamlit web interface (no programming required)
+* N-way ANOVA with Type III sums of squares and comprehensive effect sizes (η², ω², ε²)
+* Simple effects analysis for significant interactions
+* ART ANOVA for design-appropriate non-parametric validation
+* Post-hoc mean comparisons (Tukey's HSD / Fisher's LSD) via R's `agricolae` with a native Python fallback
+* Benjamini-Hochberg FDR correction (within-response and across-response)
+* SHAP feature importance with null-distribution filtering and bootstrap confidence intervals
+* Permutation feature importance validation
+* GroupKFold cross-validation (to prevent data leakage from replicate samples)
+* Model comparison (Random Forest, Linear Regression, Gaussian Process Regression) with Nadeau-Bengio corrected t-tests
+* Multi-seed stability analysis
+* Multi-Output Random Forest out-of-fold residual correlation analysis
+* Principal Component Analysis with biplot visualization
+* GPR interaction response surfaces
+* Comprehensive simulation study (2×2×2×2 factorial) with known ground truth
+* Publication-ready figures (600 DPI PNG + PDF, A4 single/two-column layouts)
+* Comprehensive text report generation
+* Streamlit web interface (no programming required)
 
 ## Installation
+To install the required Python dependencies, run:
 
-```bash
+```
 pip install streamlit numpy pandas matplotlib scipy statsmodels scikit-learn shap
+text
 ```
-For post-hoc letter display (optional):
-```bash
-# Install R and agricolae package
-R -e 'install.packages("agricolae")'
-```
+
+For post-hoc letter display (optional but highly recommended), install R and the `agricolae` package:
+
+R -e "install.packages('agricolae')"
+text
+
+
 ## Usage
-```bash
-streamlit run Home.py
+To launch the Streamlit web interface, run:
 ```
-License
+streamlit run Home.py
+text
+```
 
-GPL-3 License
-Citation
+## Validation
+The pipeline is validated on two independent biological datasets (*Viola* spp. and *Vicia faba*) and a 4-factor simulation study with known ground truth.
 
-[Citation to be added after publication]
+## License
+This project is licensed under the GPL-3.0 License - see the LICENSE file for details.
 
+## Citation
+If you use FAME in your research, please cite:
+*Bagherieh-Najjar MB, Daqeliyeh R, Sadeghipour HR. FAME: An Integrated Factorial Analysis and Machine Learning Pipeline for Plant Experiments. Plant Methods (2026). [Under Review]*
